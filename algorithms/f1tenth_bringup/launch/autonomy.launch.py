@@ -31,14 +31,8 @@ def _as_bool(value):
     return str(value).lower() in ('1', 'true', 'yes', 'on')
 
 
-def _raceline_start_pose(csv_path):
-    """
-    Derive a simulator start pose from the selected raceline.
-
-    The simulator must start on the same path and tangent that the controller
-    will track.  Keeping a copied xyz/yaw tuple in the track catalog allows it
-    to become stale whenever a raceline is regenerated.
-    """
+def _load_raceline_geometry(csv_path):
+    """Parse a raceline CSV into points, per-vertex yaw and segment lengths."""
     with open(csv_path, newline='') as stream:
         rows = [
             row for row in csv.reader(stream)
@@ -74,6 +68,39 @@ def _raceline_start_pose(csv_path):
         )
         for index in range(count)
     ]
+    segment_length = [
+        math.hypot(
+            points[(index + 1) % count][0] - points[index][0],
+            points[(index + 1) % count][1] - points[index][1],
+        )
+        for index in range(count)
+    ]
+    return {
+        'points': points,
+        'segment_yaw': segment_yaw,
+        'segment_length': segment_length,
+        'count': count,
+    }
+
+
+def _raceline_start_pose(csv_path):
+    """
+    Derive a simulator start pose from the selected raceline.
+
+    The simulator must start on the same path and tangent that the controller
+    will track.  Keeping a copied xyz/yaw tuple in the track catalog allows it
+    to become stale whenever a raceline is regenerated.
+    """
+    x, y, yaw, _index, _geometry = _raceline_start_pose_and_index(csv_path)
+    return x, y, yaw
+
+
+def _raceline_start_pose_and_index(csv_path):
+    geometry = _load_raceline_geometry(csv_path)
+    points = geometry['points']
+    segment_yaw = geometry['segment_yaw']
+    count = geometry['count']
+
     curvature = []
     for index in range(count):
         yaw_delta = (
@@ -97,7 +124,22 @@ def _raceline_start_pose(csv_path):
     start_index = min(
         range(count), key=local_peak_curvature.__getitem__)
     x, y = points[start_index]
-    return x, y, segment_yaw[start_index]
+    return x, y, segment_yaw[start_index], start_index, geometry
+
+
+def _raceline_pose_forward_of(geometry, start_index, offset):
+    """Return the pose ``offset`` metres ahead of ``start_index`` on the lap."""
+    points = geometry['points']
+    segment_length = geometry['segment_length']
+    segment_yaw = geometry['segment_yaw']
+    count = geometry['count']
+    remaining = max(0.0, float(offset))
+    index = start_index
+    while remaining > segment_length[index] and segment_length[index] > 1e-9:
+        remaining -= segment_length[index]
+        index = (index + 1) % count
+    x, y = points[index]
+    return x, y, segment_yaw[index]
 
 
 def _launch_setup(context, catalog_path, vehicle_path):
@@ -219,11 +261,29 @@ def _launch_setup(context, catalog_path, vehicle_path):
         if friction_arg == 'auto' else friction_arg)
     obstacle_mode = LaunchConfiguration('obstacles').perform(context)
 
+    opponent_enabled = _as_bool(
+        LaunchConfiguration('opponent').perform(context))
+    opponent_speed = float(
+        LaunchConfiguration('opponent_speed').perform(context))
+    opponent_start_offset = float(
+        LaunchConfiguration('opponent_start_offset').perform(context))
+
     if track.get('start') == 'raceline':
-        start_x, start_y, start_yaw = _raceline_start_pose(
-            waypoint_csv)
+        start_x, start_y, start_yaw, start_index, raceline_geometry = (
+            _raceline_start_pose_and_index(waypoint_csv))
     else:
         start_x, start_y, start_yaw = track['start']
+        start_index, raceline_geometry = None, None
+
+    if opponent_enabled:
+        if raceline_geometry is None:
+            # A fixed track['start'] pose has no raceline index to offset
+            # from. Fall back to the raceline's own point 0 in that case.
+            raceline_geometry = _load_raceline_geometry(waypoint_csv)
+            start_index = 0
+        opp_start_x, opp_start_y, opp_start_yaw = _raceline_pose_forward_of(
+            raceline_geometry, start_index, opponent_start_offset)
+
     common = {
         'map_path': os.path.join(
             get_package_share_directory('f1tenth_gym_ros'),
@@ -252,11 +312,20 @@ def _launch_setup(context, catalog_path, vehicle_path):
         'steering_command_delay': vehicle['steering_command_delay'],
         'max_acceleration': vehicle['max_acceleration'],
     }
+    if opponent_enabled:
+        common.update({
+            'num_agent': 2,
+            'start_x1': opp_start_x,
+            'start_y1': opp_start_y,
+            'start_yaw1': opp_start_yaw,
+        })
 
     return [
         LogInfo(msg=(
             f'track={track_name} controller={controller} '
-            f'speed={requested_speed:.2f}m/s friction={friction}')),
+            f'speed={requested_speed:.2f}m/s friction={friction} '
+            + (f'opponent={opponent_speed:.2f}m/s' if opponent_enabled
+               else 'opponent=off'))),
         _include('f1tenth_gym_ros', 'gym_bridge_launch.py', common),
         _include('planning', 'planning.launch.py', {
             'waypoint_csv': waypoint_csv,
@@ -275,6 +344,7 @@ def _launch_setup(context, catalog_path, vehicle_path):
             'vehicle_width': vehicle['width'],
             'wheelbase': vehicle['wheelbase'],
             'max_steering_angle': vehicle['max_steering_angle'],
+            'dynamic_obstacle_enabled': 'true' if opponent_enabled else 'false',
         }),
         _include('control', 'control.launch.py', {
             'controller': controller,
@@ -295,6 +365,9 @@ def _launch_setup(context, catalog_path, vehicle_path):
                 'avoidance_speed_limit').perform(context),
             'steering_lookup_table': LaunchConfiguration(
                 'steering_lookup_table').perform(context),
+            'opponent': 'true' if opponent_enabled else 'false',
+            'opponent_speed': opponent_speed,
+            'opponent_waypoint_csv': waypoint_csv,
         }),
     ]
 
@@ -393,6 +466,21 @@ def generate_launch_description():
             default_value='-1',
             description=(
                 'Simulation obstacle seed; -1 randomizes each fresh run'),
+        ),
+        DeclareLaunchArgument(
+            'opponent', default_value='false',
+            description=(
+                'sim mode only: spawn a second agent (num_agent:=2) driven '
+                'at a constant speed, and enable dynamic-obstacle avoidance '
+                'in local_obstacle_planner_node')),
+        DeclareLaunchArgument(
+            'opponent_speed', default_value='1.0',
+            description='Constant opponent speed in m/s'),
+        DeclareLaunchArgument(
+            'opponent_start_offset', default_value='3.0',
+            description=(
+                'Metres ahead of the ego start pose, along the raceline, '
+                'where the opponent spawns'),
         ),
         DeclareLaunchArgument('rviz', default_value='true'),
         OpaqueFunction(

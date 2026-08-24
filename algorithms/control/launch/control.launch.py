@@ -44,6 +44,37 @@ def _as_bool(value):
     return str(value).lower() in ('1', 'true', 'yes', 'on')
 
 
+def _opponent_actions(context):
+    """Optionally spawn a constant-speed second-agent driver for testing.
+
+    Only meaningful when the sim was started with num_agent:=2 (see
+    autonomy.launch.py's `opponent` argument, which sets both). Real mode
+    ignores this -- there is no second physical car.
+    """
+    if not _as_bool(LaunchConfiguration('opponent').perform(context)):
+        return []
+    return [Node(
+        package='control',
+        executable='opponent_driver_node',
+        name='opponent_driver_node',
+        output='screen',
+        parameters=[{
+            'waypoint_csv': LaunchConfiguration(
+                'opponent_waypoint_csv').perform(context),
+            'odom_topic': LaunchConfiguration(
+                'opponent_odom_topic').perform(context),
+            'drive_topic': LaunchConfiguration(
+                'opponent_drive_topic').perform(context),
+            'target_speed': float(LaunchConfiguration(
+                'opponent_speed').perform(context)),
+            'wheelbase': float(LaunchConfiguration(
+                'wheelbase').perform(context)),
+            'max_steering_angle': float(LaunchConfiguration(
+                'max_steering_angle').perform(context)),
+        }],
+    )]
+
+
 def _launch_setup(context):
     package_share = get_package_share_directory('control')
     controller = LaunchConfiguration('controller').perform(context)
@@ -59,7 +90,9 @@ def _launch_setup(context):
             'maximum_speed must be greater than 0 and at most '
             f'{SOFTWARE_SPEED_CEILING:g} m/s; got {maximum_speed!r}.')
     if controller == 'none':
-        return [LogInfo(msg='Controller disabled (controller:=none)')]
+        return (
+            [LogInfo(msg='Controller disabled (controller:=none)')]
+            + _opponent_actions(context))
 
     pure_pursuit_family = {
         'pure_pursuit': 'pure_pursuit_node',
@@ -150,7 +183,7 @@ def _launch_setup(context):
                 output='screen',
                 parameters=[{'kill_switch_button': 6}],
             ),
-        ]
+        ] + _opponent_actions(context)
 
     if controller == 'forza_map':
         profile_name = LaunchConfiguration('mpc_profile').perform(context)
@@ -263,7 +296,7 @@ def _launch_setup(context):
                 output='screen',
                 parameters=[{'kill_switch_button': 6}],
             ),
-        ]
+        ] + _opponent_actions(context)
 
     if controller == 'unicorn_l1':
         # UNICORN builds a spatial speed profile from every received path.  The
@@ -346,7 +379,7 @@ def _launch_setup(context):
                 output='screen',
                 parameters=[{'kill_switch_button': 6}],
             ),
-        ]
+        ] + _opponent_actions(context)
 
     if controller == 'woong_pp':
         # Same wiring as the unicorn_l1 branch above -- this is a separate
@@ -436,7 +469,7 @@ def _launch_setup(context):
                 output='screen',
                 parameters=[{'kill_switch_button': 6}],
             ),
-        ]
+        ] + _opponent_actions(context)
 
     if controller not in ('mpc', 'mpcc'):
         raise RuntimeError(
@@ -514,7 +547,7 @@ def _launch_setup(context):
             output='screen',
             parameters=[parameters],
         ),
-    ]
+    ] + _opponent_actions(context)
 
 
 def generate_launch_description():
@@ -603,5 +636,23 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'emergency_stop_topic',
             default_value='/safety/emergency_stop'),
+        DeclareLaunchArgument(
+            'opponent', default_value='false',
+            description=(
+                'Spawn a constant-speed second-agent driver; only useful '
+                'when the sim was started with num_agent:=2')),
+        DeclareLaunchArgument(
+            'opponent_speed', default_value='1.0',
+            description='Constant opponent speed in m/s'),
+        DeclareLaunchArgument(
+            'opponent_waypoint_csv',
+            default_value=os.path.join(
+                get_package_share_directory('planning'), 'waypoints',
+                'track03_raceline.csv'),
+            description='Raceline the opponent drives at constant speed'),
+        DeclareLaunchArgument(
+            'opponent_odom_topic', default_value='/opp_racecar/odom'),
+        DeclareLaunchArgument(
+            'opponent_drive_topic', default_value='/opp_drive'),
         OpaqueFunction(function=_launch_setup),
     ])

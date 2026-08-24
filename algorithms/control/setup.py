@@ -50,6 +50,7 @@ setup(
             'forza_map_node = control.forza_map_node:main',
             'kill_switch_node = control.kill_switch_node:main',
             'kill_switch_demo_node = control.kill_switch_demo_node:main',
+            'opponent_driver_node = control.opponent_driver_node:main',
         ],
     },
 )

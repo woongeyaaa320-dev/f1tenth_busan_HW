@@ -108,3 +108,23 @@ local_obstacle_planner_node:
     candidate_curvature_weight: 0.35
     candidate_clearance_weight: 0.10
     curvature_percentile: 85.0
+
+    # Dynamic (moving) obstacle tracking, off by default. Enabled by
+    # autonomy.launch.py when opponent:=true. See local_obstacle_planner_node
+    # for why this uses a plain constant-velocity prediction instead of a
+    # Kalman/alpha-beta filter: the sim odometry source is noise-free.
+    dynamic_obstacle_enabled: false
+    opponent_odom_topic: "/opp_racecar/odom"
+    dynamic_obstacle_timeout: 0.50
+    dynamic_obstacle_radius: 0.20
+    # How far ahead the constant-velocity model is trusted.
+    dynamic_prediction_time: 1.5
+    # Extra swept-footprint margin (m) per second of prediction, covering the
+    # constant-velocity/constant-heading assumption error over that horizon.
+    dynamic_uncertainty_growth: 0.30
+    # Extra lateral clearance (m) per (m/s) of closing speed.
+    dynamic_margin_gain: 0.12
+    # Extra detection horizon (m) per (m/s) of closing speed.
+    dynamic_horizon_gain: 0.35
+    # Extra speed-limit reduction (m/s) per (m/s) of closing speed.
+    dynamic_speed_derate_gain: 0.25

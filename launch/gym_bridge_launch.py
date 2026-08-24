@@ -54,12 +54,14 @@ def _launch_setup(context, config, config_dict):
                 or not 0.0 <= amcl_odom_noise <= 1.0):
             raise RuntimeError(
                 'amcl_odom_noise must be auto or a value from 0.0 to 1.0')
+    num_agent = int(LaunchConfiguration('num_agent').perform(context))
     bridge_overrides = {
         'map_path': map_path,
         'map_img_ext': map_ext,
         'sx': start_x,
         'sy': start_y,
         'stheta': start_yaw,
+        'num_agent': num_agent,
         'friction_mu': float(LaunchConfiguration('friction').perform(context)),
         'obstacle_path_csv': centerline,
         'random_obstacles_enabled': _as_bool(
@@ -83,7 +85,14 @@ def _launch_setup(context, config, config_dict):
         'max_acceleration': float(LaunchConfiguration(
             'max_acceleration').perform(context)),
     }
-    has_opp = parameters['num_agent'] > 1
+    if num_agent > 1:
+        bridge_overrides.update({
+            'sx1': float(LaunchConfiguration('start_x1').perform(context)),
+            'sy1': float(LaunchConfiguration('start_y1').perform(context)),
+            'stheta1': float(
+                LaunchConfiguration('start_yaw1').perform(context)),
+        })
+    has_opp = num_agent > 1
 
     actions = []
     if _as_bool(LaunchConfiguration('rviz').perform(context)):
@@ -250,6 +259,15 @@ def generate_launch_description():
                 'replays the same obstacle layout for regression tests'),
         ),
         DeclareLaunchArgument('rviz', default_value='true'),
+        DeclareLaunchArgument(
+            'num_agent', default_value=str(parameters['num_agent']),
+            description='1 for ego only, 2 to also spawn opp_racecar'),
+        DeclareLaunchArgument(
+            'start_x1', default_value=str(parameters['sx1'])),
+        DeclareLaunchArgument(
+            'start_y1', default_value=str(parameters['sy1'])),
+        DeclareLaunchArgument(
+            'start_yaw1', default_value=str(parameters['stheta1'])),
         OpaqueFunction(
             function=_launch_setup,
             kwargs={'config': config, 'config_dict': config_dict},

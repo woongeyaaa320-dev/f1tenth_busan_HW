@@ -135,6 +135,28 @@ class LocalObstaclePlannerNode(Node):
         self.declare_parameter('candidate_clearance_weight', 0.10)
         self.declare_parameter('curvature_percentile', 90.0)
 
+        # Dynamic (moving) obstacle tracking. This is a separate channel from
+        # the scan-cluster pipeline above: rather than waiting for repeated
+        # noisy LiDAR observations to confirm a track (which, for a fast
+        # object, both lags its true position through the running-mean
+        # update in update_tracked_obstacles() and can lose association
+        # between frames once it moves more than obstacle_match_distance),
+        # a second agent's own published odometry is used directly. In this
+        # simulator that topic is ground truth with no noise, so a
+        # constant-velocity prediction is used instead of a Kalman/alpha-beta
+        # filter -- filtering would only add lag here with nothing to smooth.
+        # A noisier real source (V2V telemetry, a dedicated radar/vision
+        # tracker) would be the place to add one.
+        self.declare_parameter('dynamic_obstacle_enabled', False)
+        self.declare_parameter('opponent_odom_topic', '/opp_racecar/odom')
+        self.declare_parameter('dynamic_obstacle_timeout', 0.5)
+        self.declare_parameter('dynamic_obstacle_radius', 0.20)
+        self.declare_parameter('dynamic_prediction_time', 1.5)
+        self.declare_parameter('dynamic_uncertainty_growth', 0.30)
+        self.declare_parameter('dynamic_margin_gain', 0.12)
+        self.declare_parameter('dynamic_horizon_gain', 0.35)
+        self.declare_parameter('dynamic_speed_derate_gain', 0.25)
+
         self.global_frame = self.get_parameter('global_frame_id').value
         self.odom_frame = self.get_parameter('odom_frame_id').value
         self.base_frame = self.get_parameter('base_frame_id').value
@@ -273,6 +295,25 @@ class LocalObstaclePlannerNode(Node):
         self.curvature_percentile = float(
             self.get_parameter('curvature_percentile').value)
 
+        self.dynamic_obstacle_enabled = bool(
+            self.get_parameter('dynamic_obstacle_enabled').value)
+        self.dynamic_obstacle_timeout = float(
+            self.get_parameter('dynamic_obstacle_timeout').value)
+        self.dynamic_obstacle_radius = float(
+            self.get_parameter('dynamic_obstacle_radius').value)
+        self.dynamic_prediction_time = max(0.0, float(
+            self.get_parameter('dynamic_prediction_time').value))
+        self.dynamic_uncertainty_growth = max(0.0, float(
+            self.get_parameter('dynamic_uncertainty_growth').value))
+        self.dynamic_margin_gain = max(0.0, float(
+            self.get_parameter('dynamic_margin_gain').value))
+        self.dynamic_horizon_gain = max(0.0, float(
+            self.get_parameter('dynamic_horizon_gain').value))
+        self.dynamic_speed_derate_gain = max(0.0, float(
+            self.get_parameter('dynamic_speed_derate_gain').value))
+        self.opponent_state = None
+        self._dynamic_closing_speed = 0.0
+
         self.path_geometry = None
         self.map_clearance_grid = None
         self.map_info = None
@@ -337,6 +378,13 @@ class LocalObstaclePlannerNode(Node):
             self.odom_callback,
             10,
             callback_group=self.sensor_callback_group)
+        if self.dynamic_obstacle_enabled:
+            self.create_subscription(
+                Odometry,
+                self.get_parameter('opponent_odom_topic').value,
+                self.opponent_odom_callback,
+                10,
+                callback_group=self.sensor_callback_group)
 
         self.path_pub = self.create_publisher(
             Path, self.get_parameter('local_path_topic').value, 1)
@@ -412,6 +460,21 @@ class LocalObstaclePlannerNode(Node):
 
     def odom_callback(self, message):
         self.speed = max(0.0, float(message.twist.twist.linear.x))
+
+    def opponent_odom_callback(self, message):
+        # gym_bridge publishes this topic directly from the simulator's
+        # world-frame pose (see f1tenth_gym_ros/gym_bridge.py), with no AMCL
+        # or noise model in between -- world coordinates equal map
+        # coordinates for this simulator, so no further transform is applied
+        # here. A real second vehicle would need an actual localized/relative
+        # pose source in place of this ground-truth sim channel.
+        self.opponent_state = {
+            'x': float(message.pose.pose.position.x),
+            'y': float(message.pose.pose.position.y),
+            'yaw': self.quaternion_to_yaw(message.pose.pose.orientation),
+            'speed': float(message.twist.twist.linear.x),
+            'stamp': self.get_clock().now().nanoseconds * 1e-9,
+        }
 
     def current_map_base_pose(self):
         try:
@@ -663,6 +726,120 @@ class LocalObstaclePlannerNode(Node):
                 self.obstacle_match_distance,
                 self.obstacle_memory))
 
+    def effective_obstacle_margin(self, obstacle):
+        """Return the safety margin to use for this specific obstacle.
+
+        A dynamic obstacle gets extra margin proportional to how fast the
+        gap to it is closing, on top of the usual static margin. A dynamic
+        obstacle that is not closing (same direction, moving away or faster
+        than ego) keeps the plain static margin -- there is no dynamics-based
+        reason to widen it further.
+        """
+        margin = self.obstacle_margin
+        if obstacle.get('dynamic'):
+            closing_speed = max(0.0, float(obstacle.get('closing_speed', 0.0)))
+            margin += self.dynamic_margin_gain * closing_speed
+        return margin
+
+    def _frenet_extent(self, points):
+        """Project a set of XY points into this obstacle's local Frenet frame.
+
+        Mirrors the per-cluster projection in process_scan(): decomposing
+        every point in the segment tangent/normal at the centroid's own
+        projection keeps a compact object's extent from being inflated by
+        independently projecting points that straddle a curved segment.
+        """
+        points = np.asarray(points, dtype=float).reshape((-1, 2))
+        center = np.mean(points, axis=0)
+        s_value, lateral, _ = self.path_geometry.project(center)
+        segment_index = int(np.searchsorted(
+            self.path_geometry.cumulative, s_value,
+            side='right') - 1) % len(self.path_geometry.points)
+        heading = float(self.path_geometry.yaw[segment_index])
+        tangent = np.asarray([math.cos(heading), math.sin(heading)])
+        normal = np.asarray([-math.sin(heading), math.cos(heading)])
+        relative = points - center
+        lateral_offsets = lateral + relative @ normal
+        longitudinal_offsets = relative @ tangent
+        return (
+            center, s_value, lateral,
+            float(np.min(lateral_offsets)), float(np.max(lateral_offsets)),
+            float(np.min(longitudinal_offsets)),
+            float(np.max(longitudinal_offsets)))
+
+    def dynamic_obstacle_entry(self, now_seconds):
+        """Predict the tracked opponent's swept footprint as one obstacle.
+
+        Unlike scan-based tracks, this is rebuilt fresh from the latest
+        odometry every call -- there is no hit-confirmation delay and no
+        running-mean position lag, so the caller can feed it into planning
+        every single cycle without ever falling back to a stale, locked
+        avoidance path while the opponent stays in range.
+        """
+        if (not self.dynamic_obstacle_enabled
+                or self.opponent_state is None
+                or self.path_geometry is None):
+            return None
+        age = now_seconds - self.opponent_state['stamp']
+        if age > self.dynamic_obstacle_timeout:
+            return None
+
+        state = self.opponent_state
+        position = np.asarray([state['x'], state['y']])
+        velocity = state['speed'] * np.asarray([
+            math.cos(state['yaw']), math.sin(state['yaw'])])
+        predicted_position = position + velocity * self.dynamic_prediction_time
+
+        half_length = 0.5 * self.vehicle_length
+        half_width = 0.5 * self.vehicle_width
+        cos_yaw, sin_yaw = math.cos(state['yaw']), math.sin(state['yaw'])
+        local_corners = (
+            (half_length, half_width), (half_length, -half_width),
+            (-half_length, half_width), (-half_length, -half_width))
+        surface_points = np.asarray([
+            (origin[0] + cos_yaw * lx - sin_yaw * ly,
+             origin[1] + sin_yaw * lx + cos_yaw * ly)
+            for origin in (position, predicted_position)
+            for lx, ly in local_corners
+        ])
+
+        (center, s_value, lateral, lateral_min, lateral_max,
+         longitudinal_min, longitudinal_max) = self._frenet_extent(
+            surface_points)
+
+        segment_index = int(np.searchsorted(
+            self.path_geometry.cumulative, s_value,
+            side='right') - 1) % len(self.path_geometry.points)
+        tangent = np.asarray([
+            math.cos(float(self.path_geometry.yaw[segment_index])),
+            math.sin(float(self.path_geometry.yaw[segment_index]))])
+        along_track_speed = float(np.dot(velocity, tangent))
+        # Positive when the gap to the opponent is shrinking: ego catching up
+        # from behind, or the opponent approaching against the nominal path
+        # direction (along_track_speed negative, so subtracting it adds).
+        closing_speed = max(0.0, self.speed - along_track_speed)
+
+        uncertainty = self.dynamic_uncertainty_growth * self.dynamic_prediction_time
+
+        return {
+            'id': -1,
+            'center': center,
+            'radius': max(
+                0.5 * math.hypot(self.vehicle_length, self.vehicle_width),
+                self.dynamic_obstacle_radius),
+            's': s_value,
+            'lateral': lateral,
+            'lateral_min': lateral_min,
+            'lateral_max': lateral_max,
+            'longitudinal_min': longitudinal_min - uncertainty,
+            'longitudinal_max': longitudinal_max + uncertainty,
+            'surface_points': surface_points,
+            'hits': self.obstacle_confirmation_frames,
+            'last_seen': now_seconds,
+            'dynamic': True,
+            'closing_speed': closing_speed,
+        }
+
     def vehicle_pose(self):
         return self.current_map_base_pose()[:2]
 
@@ -707,9 +884,13 @@ class LocalObstaclePlannerNode(Node):
             longest_transition
             + planning_speed * self.planning_reaction_time
             + self.planning_distance_margin)
+        # A closing dynamic obstacle shrinks the available reaction time by
+        # its own approach speed on top of ego's; widen detection range to
+        # compensate instead of only reacting once it is already close.
+        dynamic_extra = self.dynamic_horizon_gain * self._dynamic_closing_speed
         return min(
             self.maximum_planning_horizon,
-            max(stopping_horizon, transition_horizon))
+            max(stopping_horizon, transition_horizon) + dynamic_extra)
 
     def current_avoidance_distances(self, offset=0.0):
         # Sample geometry independently from the requested velocity ceiling.
@@ -758,6 +939,7 @@ class LocalObstaclePlannerNode(Node):
 
         minimum_obstacle_clearance = float('inf')
         for obstacle in obstacles:
+            obstacle_margin = self.effective_obstacle_margin(obstacle)
             surface_points = obstacle.get('surface_points')
             if surface_points is not None and len(surface_points):
                 minimum = minimum_surface_footprint_clearance(
@@ -765,7 +947,7 @@ class LocalObstaclePlannerNode(Node):
                     surface_points,
                     self.vehicle_length,
                     self.vehicle_width,
-                    self.obstacle_margin
+                    obstacle_margin
                     + self.candidate_clearance_buffer)
             else:
                 minimum = minimum_surface_footprint_clearance(
@@ -773,7 +955,7 @@ class LocalObstaclePlannerNode(Node):
                     np.asarray([obstacle['center']]),
                     self.vehicle_length + 2.0 * obstacle['radius'],
                     self.vehicle_width + 2.0 * obstacle['radius'],
-                    self.obstacle_margin
+                    obstacle_margin
                     + self.candidate_clearance_buffer)
             minimum_obstacle_clearance = min(
                 minimum_obstacle_clearance, minimum)
@@ -799,22 +981,30 @@ class LocalObstaclePlannerNode(Node):
         # here as well keeps the path displaced twice as long and can push its
         # return transition into an otherwise unrelated wall.  The plateau
         # therefore represents only the measured object's longitudinal span.
-        fallback = obstacle['radius'] + self.obstacle_margin
+        margin = self.effective_obstacle_margin(obstacle)
+        fallback = obstacle['radius'] + margin
         longitudinal_min = obstacle.get('longitudinal_min')
         longitudinal_max = obstacle.get('longitudinal_max')
         if longitudinal_min is None or longitudinal_max is None:
             return fallback, fallback
         hold_before = (
             max(0.0, -float(longitudinal_min))
-            + self.obstacle_margin)
+            + margin)
         hold_after = (
             max(0.0, float(longitudinal_max))
-            + self.obstacle_margin)
+            + margin)
         return hold_before, hold_after
 
     def obstacle_group_plateau_distances(self, primary, obstacles):
         """Cover consecutive detected obstacles with one lateral corridor."""
         relative_extents = []
+        # A dynamic obstacle in the group should widen the whole plateau, not
+        # just its own extent, since the offset it forces is shared by every
+        # obstacle covered by this one corridor.
+        margin = max(
+            (self.effective_obstacle_margin(obstacle)
+             for obstacle in obstacles),
+            default=self.obstacle_margin)
         for obstacle in obstacles:
             longitudinal_min = obstacle.get('longitudinal_min')
             longitudinal_max = obstacle.get('longitudinal_max')
@@ -835,8 +1025,8 @@ class LocalObstaclePlannerNode(Node):
         if not relative_extents:
             return self.obstacle_plateau_distances(primary)
         return (
-            max(0.0, -min(relative_extents)) + self.obstacle_margin,
-            max(0.0, max(relative_extents)) + self.obstacle_margin,
+            max(0.0, -min(relative_extents)) + margin,
+            max(0.0, max(relative_extents)) + margin,
         )
 
     def publish_speed_limit(self, value):
@@ -995,8 +1185,30 @@ class LocalObstaclePlannerNode(Node):
             return
 
         vehicle_s, _, _ = self.path_geometry.project(vehicle_xy)
+        now_seconds = self.get_clock().now().nanoseconds * 1e-9
+        dynamic_obstacle = self.dynamic_obstacle_entry(now_seconds)
+        self._dynamic_closing_speed = (
+            max(0.0, float(dynamic_obstacle['closing_speed']))
+            if dynamic_obstacle is not None else 0.0)
         planning_horizon = self.current_planning_horizon()
         active = self.active_obstacles(vehicle_s)
+        if dynamic_obstacle is not None:
+            dynamic_forward = self.path_geometry.forward_distance(
+                vehicle_s, dynamic_obstacle['s'])
+            if dynamic_forward <= planning_horizon:
+                # The opponent may also show up as its own scan cluster.
+                # De-duplicating that against the odom-predicted entry was
+                # tried and reverted: obstacles and the opponent both travel
+                # near the same raceline, so a proximity radius wide enough
+                # to catch the opponent's own reflection also catches a
+                # genuinely different nearby obstacle and erases it from
+                # `active`. A redundant pair of entries for the same physical
+                # car is merely inefficient; erasing a different obstacle by
+                # mistake is not. Both entries are kept and the existing
+                # multi-obstacle candidate search below already handles
+                # overlapping/duplicate obstacles safely.
+                active.append((dynamic_forward, dynamic_obstacle))
+                active.sort(key=lambda item: item[0])
         selected = self.path_geometry.points
         selected_offset = 0.0
         selected_after = self.avoidance_after
@@ -1049,7 +1261,7 @@ class LocalObstaclePlannerNode(Node):
                 required_lateral_clearance = (
                     self.vehicle_clearance
                     + surface_half_width
-                    + self.obstacle_margin
+                    + self.effective_obstacle_margin(obstacle)
                     + self.candidate_clearance_buffer)
                 for value in adaptive_candidate_offsets(
                         obstacle_lateral,
@@ -1234,8 +1446,14 @@ class LocalObstaclePlannerNode(Node):
             curve_speed = math.sqrt(
                 self.max_lateral_acceleration
                 / max(selected_curvature, 1e-3))
+            # A high closing rate to a moving obstacle leaves less time to
+            # react than the same curvature would around a static one; derate
+            # the curvature-based limit further, on top of it, rather than
+            # replacing it.
+            dynamic_derate = (
+                self.dynamic_speed_derate_gain * self._dynamic_closing_speed)
             speed_limit = min(speed_limit, max(
-                self.minimum_avoidance_speed, curve_speed))
+                self.minimum_avoidance_speed, curve_speed - dynamic_derate))
         if stop.data:
             speed_limit = 0.0
         self.publish_speed_limit(speed_limit)
@@ -1250,9 +1468,13 @@ class LocalObstaclePlannerNode(Node):
                 for result in candidate_results)
             self.set_status('NO_COLLISION_FREE_PATH ' + details)
         elif active and abs(selected_offset) > 1e-3:
+            primary_obstacle = active[0][1]
+            dynamic_suffix = (
+                ' closing=%.2fm/s' % primary_obstacle['closing_speed']
+                if primary_obstacle.get('dynamic') else '')
             self.set_status(
-                'AVOIDING obstacle=%d offset=%+.2fm'
-                % (active[0][1]['id'], selected_offset))
+                'AVOIDING obstacle=%d offset=%+.2fm%s'
+                % (primary_obstacle['id'], selected_offset, dynamic_suffix))
         elif retained_avoidance:
             self.set_status(
                 'AVOIDING_LOCKED_PATH offset=%+.2fm' % selected_offset)

@@ -33,6 +33,8 @@ def _launch_setup(context):
             'wheelbase').perform(context)),
         'max_steering_angle': float(LaunchConfiguration(
             'max_steering_angle').perform(context)),
+        'dynamic_obstacle_enabled': _as_bool(LaunchConfiguration(
+            'dynamic_obstacle_enabled').perform(context)),
     }
     waypoint_overrides = {
         'waypoint_csv': LaunchConfiguration('waypoint_csv').perform(context),
@@ -88,5 +90,11 @@ def generate_launch_description():
         DeclareLaunchArgument('vehicle_width', default_value='0.31'),
         DeclareLaunchArgument('wheelbase', default_value='0.324'),
         DeclareLaunchArgument('max_steering_angle', default_value='0.4189'),
+        DeclareLaunchArgument(
+            'dynamic_obstacle_enabled', default_value='false',
+            description=(
+                'Track a second agent from its ground-truth odometry '
+                '(opponent_odom_topic) as a predicted dynamic obstacle, in '
+                'addition to scan-detected static obstacles')),
         OpaqueFunction(function=_launch_setup),
     ])
