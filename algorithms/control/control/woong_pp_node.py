@@ -8,6 +8,23 @@ https://github.com/HMCL-UNIST/unicorn-racing-stack
 This adapter intentionally uses this project's existing nav_msgs/Path, TF,
 odometry, safety, and Ackermann interfaces.  It does not pretend to be MPC:
 UNICORN's current controller is an L1/Pure-Pursuit controller.
+
+This specific variant (WoongPpNode / controller:=woong_pp) is
+ported from woongeyaaa320-dev/f1tenth-obstacle-tuning (a fork of this same
+project's obstacle-avoidance-tuning branch). It adds several stability
+mechanisms this project's own unicorn_l1_node.py does not have: a grace
+period before a single-cycle heading-error glitch triggers a full stop
+(HeadingErrorFault), a position-jump reset for the nearest-index search,
+a post-maneuver acceleration hold after a corner/avoidance manoeuvre, and a
+capped lateral-error steering gain. Its own README documents these fixes as
+validated only at low speed in sim (maximum_speed:=1.5 m/s recommended;
+2.4+ m/s showed reproducible collisions on some obstacle placements) -- it
+has NOT been tuned or validated for this project's real-car targets (8+
+m/s). Its `t_clip_min`/`t_clip_max` (1.10/8.00) also differ from this
+project's own unicorn_l1_node.py (0.70/3.00, sized down for this project's
+short ~23 m test tracks) -- treat this as a separate, unvalidated-at-speed
+controller to test incrementally from a low speed:=, not a drop-in
+replacement.
 """
 
 import math
@@ -27,6 +44,18 @@ from std_msgs.msg import Bool, Float32
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
+
+
+class HeadingErrorFault(RuntimeError):
+    """Raised when the tracked heading error exceeds ``max_heading_error``.
+
+    Kept distinct from other ``RuntimeError`` causes (stale path, vehicle too
+    far from path) because this one is observed to occur as a single-cycle
+    localization glitch (e.g. AMCL briefly misreading pose during an
+    aggressive avoidance swerve) that self-corrects within a few control
+    cycles.  It is handled with the same brief hold-last-command grace period
+    already used for transient TF faults, instead of an instant full stop.
+    """
 
 
 def build_closed_velocity_profile(
@@ -76,14 +105,14 @@ def build_closed_velocity_profile(
     return profile
 
 
-class UnicornL1Node(Node):
+class WoongPpNode(Node):
     """L1/Pure-Pursuit tracker using UNICORN's adaptive guidance strategy."""
 
     controller_label = 'UNICORN L1'
     topic_prefix = '/unicorn_l1'
 
     def __init__(self):
-        super().__init__('unicorn_l1_node')
+        super().__init__('woong_pp_node')
 
         self.declare_parameter('enabled', False)
         self.declare_parameter('solve_when_disabled', True)
@@ -96,6 +125,8 @@ class UnicornL1Node(Node):
         self.declare_parameter('collision_topic', '/ego_racecar/collision')
         self.declare_parameter(
             'emergency_stop_topic', '/safety/emergency_stop')
+        # Rule 3.3.1 manual on/off kill switch, independent of AEB.
+        self.declare_parameter('kill_switch_topic', '/safety/kill_switch')
         self.declare_parameter(
             'avoidance_active_topic', '/planning/avoidance_active')
         self.declare_parameter('speed_limit_topic', '/planning/speed_limit')
@@ -119,50 +150,34 @@ class UnicornL1Node(Node):
         # Only transient TF lookup failures may hold the last safe command.
         # Collision, AEB and invalid-path conditions still stop immediately.
         self.declare_parameter('transform_fault_grace', 0.10)
+        # A stationary vehicle gives AMCL no new odometry to resample on, so
+        # a heading-error fault that is allowed to reach a full stop can
+        # never self-correct.  Bridging brief glitches here (same grace
+        # style as transform_fault_grace) keeps the vehicle moving long
+        # enough for AMCL's own recovery resampling to fix the estimate.
+        self.declare_parameter('heading_error_grace', 0.10)
 
         # UNICORN controller.yaml defaults. Distance-window curvature sampling
         # replaces its waypoint-index window so behavior is path-resolution
         # independent.
-        self.declare_parameter('t_clip_min', 0.70)
-        # 8.00 (UNICORN's original default) is over 1/3 of track03's ~23m
-        # lap: on a straight run-up (near-zero curvature, so the
-        # l1_curvature_preview_distance ceiling below doesn't engage) the L1
-        # target point can land well past where the track actually bends,
-        # steering into a wall the reference path itself already curves
-        # away from. Reproduced: closed-loop sim test collision at a
-        # near-straight, high-speed (~5.9 m/s) segment despite near-zero
-        # cross-track error. Track03 and track02 are both short practice
-        # tracks (~23m); size this to the track, not to ForzaETH's larger
-        # reference tracks.
-        self.declare_parameter('t_clip_max', 3.00)
+        self.declare_parameter('t_clip_min', 1.10)
+        self.declare_parameter('t_clip_max', 8.00)
         self.declare_parameter('m_l1', 0.47)
         self.declare_parameter('q_l1', -0.20)
         self.declare_parameter('curvature_factor', 0.145)
         self.declare_parameter('future_constant', 0.05)
         self.declare_parameter('curvature_window_start', 0.50)
         self.declare_parameter('curvature_window_end', 1.50)
-        # Independent geometric ceiling on L1 distance: the lookahead point
-        # may not reach further than `maximum_preview_heading` radians of
-        # heading change along the sharpest curvature sampled within
-        # `l1_curvature_preview_distance` ahead. Mirrors
-        # pure_pursuit_node.active_lookahead_distance()'s curvature cap,
-        # which unicorn_l1 previously lacked -- the only shrink term it had
-        # was the reactive `curvature_factor * mean_curvature * speed^2`
-        # subtraction inside the narrow curvature_window above, which is too
-        # weak/late to stop L1 from overshooting into an upcoming tight bend
-        # at high speed (reproduced failure: highspeed_unicorn10 diverges and
-        # safety-stops at t=8.8s).
-        self.declare_parameter('maximum_preview_heading', 0.70)
-        self.declare_parameter('l1_curvature_preview_distance', 3.00)
-        # Cross-track error previously scaled steering multiplicatively and
-        # unboundedly (exp(ln2 * |lateral_error|) -> 2x at 1m error, growing
-        # without limit). ForzaETH's validated MAP controller instead lets
-        # lateral error reduce commanded *speed* (see speed_adjust_lat_err /
-        # command_speed above), not amplify steering gain; an unbounded
-        # steering multiplier is a positive-feedback risk once tracking
-        # starts to diverge. Clamp the same correction instead of removing
-        # it outright, to preserve its benefit while rejoining the path.
-        self.declare_parameter('max_lateral_error_steer_gain', 1.30)
+        # Extra L1 lookahead on a confirmed long straight, on top of the
+        # existing speed/curvature terms below. straight_lookahead_boost=1.0
+        # (default) means this has no effect at all -- a deliberately inert
+        # default so it can be tested via a launch/param override without
+        # changing behavior for anyone not explicitly opting in. See
+        # TUNING_LOG for the reasoning and test results before raising this
+        # past 1.0 as a new default.
+        self.declare_parameter('straight_curvature_threshold', 0.20)
+        self.declare_parameter('straight_reference_distance', 4.0)
+        self.declare_parameter('straight_lookahead_boost', 1.0)
         # Read the spatial speed profile ahead of the current pose so braking
         # begins before the L1 steering transition, especially when an
         # occluded static obstacle first becomes visible near a bend.
@@ -171,10 +186,33 @@ class UnicornL1Node(Node):
         self.declare_parameter('speed_factor_for_lat_err', 1.0)
         self.declare_parameter('speed_factor_for_curvature', 1.0)
         self.declare_parameter('heading_kp', 0.8)
-        self.declare_parameter('heading_kd', 0.05)
-        self.declare_parameter('heading_filter_alpha', 0.10)
+        self.declare_parameter('heading_kd', 0.0)
+        self.declare_parameter('heading_filter_alpha', 0.05)
         self.declare_parameter('heading_gain_speed', 15.0)
+        self.declare_parameter('lateral_steering_gain_cap', 0.40)
+        # A windowed nearest-point search (search_back/forward_points) is
+        # cheap per-cycle but assumes the vehicle only moves along the path
+        # between cycles.  A discontinuous position jump -- /sim_reset_pose
+        # teleporting the vehicle anywhere for a manual test, or a real
+        # kidnapped-robot AMCL correction -- leaves the search window
+        # anchored on the old location, so it can report "far from path"
+        # even when the new position is right on the raceline.  Detecting a
+        # jump and forcing one full-path search re-acquires the correct
+        # index regardless of where the vehicle appears.
+        self.declare_parameter('position_jump_reset_distance', 1.0)
         self.declare_parameter('heading_slowdown_threshold_deg', 10.0)
+        # The curvature-based speed profile only knows the path's geometry,
+        # not whether the LiDAR has actually confirmed the road ahead is
+        # clear -- right after a corner or an avoidance manoeuvre, the
+        # sensor's view forward can still be limited by what it was just
+        # looking at. Observed as a wall collision (map=True) immediately
+        # after a curved/avoidance section once the variable-speed fix
+        # let the vehicle accelerate hard coming out of it. Holding off on
+        # *acceleration* (deceleration remains unrestricted) for a short
+        # window after the last high-curvature or avoidance moment gives
+        # the sensor a chance to re-confirm a clear path before speed is
+        # allowed to climb again.
+        self.declare_parameter('post_maneuver_hold_time', 0.6)
 
         self.declare_parameter('max_path_distance', 0.80)
         self.declare_parameter('max_heading_error', 1.0472)
@@ -188,6 +226,7 @@ class UnicornL1Node(Node):
                 'odom_frame_id', 'base_frame_id', 'odom_topic', 'path_topic',
                 'drive_topic',
                 'collision_topic', 'emergency_stop_topic',
+                'kill_switch_topic',
                 'avoidance_active_topic', 'speed_limit_topic',
                 'use_dynamic_speed_limit'):
             setattr(self, name, self.get_parameter(name).value)
@@ -199,17 +238,19 @@ class UnicornL1Node(Node):
                 'max_longitudinal_deceleration', 'avoidance_speed_limit',
                 'max_steering_angle',
                 'max_steering_delta', 'max_steering_rate',
-                'transform_fault_grace',
+                'transform_fault_grace', 'heading_error_grace',
                 't_clip_min', 't_clip_max', 'm_l1',
                 'q_l1', 'curvature_factor', 'future_constant',
                 'curvature_window_start', 'curvature_window_end',
-                'maximum_preview_heading', 'l1_curvature_preview_distance',
-                'max_lateral_error_steer_gain',
+                'straight_curvature_threshold', 'straight_reference_distance',
+                'straight_lookahead_boost',
                 'speed_lookahead',
                 'lat_err_coeff', 'speed_factor_for_lat_err',
                 'speed_factor_for_curvature', 'heading_kp', 'heading_kd',
                 'heading_filter_alpha', 'heading_gain_speed',
-                'heading_slowdown_threshold_deg', 'max_path_distance',
+                'lateral_steering_gain_cap', 'position_jump_reset_distance',
+                'heading_slowdown_threshold_deg', 'post_maneuver_hold_time',
+                'max_path_distance',
                 'max_heading_error', 'odom_timeout', 'path_timeout',
                 'speed_limit_timeout'):
             setattr(self, name, float(self.get_parameter(name).value))
@@ -224,6 +265,10 @@ class UnicornL1Node(Node):
             raise RuntimeError('invalid L1 distance limits')
         if self.curvature_window_end < self.curvature_window_start:
             raise RuntimeError('invalid curvature sampling window')
+        if self.straight_lookahead_boost < 1.0:
+            raise RuntimeError(
+                'straight_lookahead_boost must be >= 1.0 (it only extends '
+                'lookahead on a confirmed straight, never shortens it)')
         if not 0.0 <= self.min_command_speed <= self.max_speed:
             raise RuntimeError(
                 'min_command_speed must be between 0 and max_speed')
@@ -239,19 +284,12 @@ class UnicornL1Node(Node):
             raise RuntimeError('max_steering_rate must be positive')
         if self.transform_fault_grace < 0.0:
             raise RuntimeError('transform_fault_grace must be non-negative')
-        if self.maximum_preview_heading <= 0.0:
-            raise RuntimeError('maximum_preview_heading must be positive')
-        if self.l1_curvature_preview_distance <= 0.0:
-            raise RuntimeError(
-                'l1_curvature_preview_distance must be positive')
-        if self.max_lateral_error_steer_gain < 1.0:
-            raise RuntimeError(
-                'max_lateral_error_steer_gain must be >= 1.0')
         self.current_odom = None
         self.last_odom_time = None
         self.last_path_time = None
         self.collision = False
         self.emergency_stop = False
+        self.kill_switch_engaged = False
         self.avoidance_active = False
         self.dynamic_speed_limit = None
         self.last_speed_limit_time = None
@@ -265,6 +303,8 @@ class UnicornL1Node(Node):
         self.path_speed_profile = None
         self.yaw_lap_change = None
         self.nearest_index = None
+        self.last_position = None
+        self.maneuver_exit_time = None
         self.previous_steering = 0.0
         self.previous_command_speed = 0.0
         self.filtered_heading_error = None
@@ -273,6 +313,7 @@ class UnicornL1Node(Node):
         self.last_status_message = None
         self.last_status_time = None
         self.transform_fault_since = None
+        self.heading_fault_since = None
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -290,6 +331,9 @@ class UnicornL1Node(Node):
         self.create_subscription(
             Bool, self.emergency_stop_topic,
             self.emergency_stop_callback, 10)
+        self.create_subscription(
+            Bool, self.kill_switch_topic,
+            self.kill_switch_callback, 10)
         self.create_subscription(
             Bool, self.avoidance_active_topic,
             self.avoidance_active_callback, 10)
@@ -351,6 +395,13 @@ class UnicornL1Node(Node):
     def emergency_stop_callback(self, message):
         self.emergency_stop = bool(message.data)
         if self.emergency_stop:
+            self.previous_command_speed = 0.0
+            self.publish_stop()
+
+    def kill_switch_callback(self, message):
+        self.kill_switch_engaged = bool(message.data)
+        if self.kill_switch_engaged:
+            self.enabled = False
             self.previous_command_speed = 0.0
             self.publish_stop()
 
@@ -460,36 +511,29 @@ class UnicornL1Node(Node):
             return 'collision input is active; clear it before starting'
         if self.emergency_stop:
             return 'local planner emergency stop is active'
+        if self.kill_switch_engaged:
+            return 'kill switch is engaged'
         return None
 
     def lookup_vehicle_pose(self):
-        # Looking up map->base_link as one TF chain uses the latest *common*
-        # timestamp.  AMCL publishes map->odom more slowly than wheel odometry,
-        # so that lookup can return a vehicle pose almost one metre behind at
-        # racing speed.  Treat map->odom as the latest localization correction
-        # and compose it with the latest odom->base_link motion instead.  This
-        # is frame-generic and matches the way a localization + odometry stack
-        # is intended to feed a high-rate controller.
-        map_from_odom = self.tf_buffer.lookup_transform(
-            self.global_frame_id, self.odom_frame_id, Time(),
+        # This originally composed map->odom (TF) with odom->base_link taken
+        # from the /odom *message*'s pose field, on the theory that AMCL's
+        # map->odom correction publishes slower than wheel odometry and this
+        # keeps the fed pose fresher at racing speed. That assumes the
+        # Odometry message's pose.pose is a real, integrated position --
+        # true in sim (f1tenth_gym_ros), but this project's real-car odom
+        # source does not populate it (pose.pose stays fixed at the
+        # all-zero default; only twist/velocity is real), which silently
+        # froze the computed vehicle pose at whatever map->odom's own
+        # translation was, regardless of where the car actually was. Use
+        # the same single TF lookup pure_pursuit_node.py already relies on
+        # successfully on this hardware instead.
+        transform = self.tf_buffer.lookup_transform(
+            self.global_frame_id, self.base_frame_id, Time(),
             timeout=Duration(seconds=0.03))
-        map_translation = map_from_odom.transform.translation
-        odom_pose = self.current_odom.pose.pose
-        odom_translation = odom_pose.position
-        map_yaw = self.quaternion_to_yaw(
-            map_from_odom.transform.rotation)
-        odom_yaw = self.quaternion_to_yaw(odom_pose.orientation)
-        cosine = math.cos(map_yaw)
-        sine = math.sin(map_yaw)
-        return (
-            map_translation.x
-            + cosine * odom_translation.x
-            - sine * odom_translation.y,
-            map_translation.y
-            + sine * odom_translation.x
-            + cosine * odom_translation.y,
-            self.angle_difference(map_yaw + odom_yaw, 0.0),
-        )
+        translation = transform.transform.translation
+        yaw = self.quaternion_to_yaw(transform.transform.rotation)
+        return translation.x, translation.y, yaw
 
     def candidate_indices(self):
         count = len(self.path_points)
@@ -507,16 +551,7 @@ class UnicornL1Node(Node):
         best = None
         best_forward = None
         count = len(self.path_points)
-        # Once progress on the closed path is known, both the current pose and
-        # UNICORN's short future projection must remain near that progress.
-        # Searching every segment for the future pose made control cost scale
-        # with the complete circuit length and could starve Scan/TF callbacks
-        # on large tracks.  Retain the full search only for initialization;
-        # thereafter use the same bounded, wrap-aware progress window.
-        indices = (
-            self.candidate_indices()
-            if self.nearest_index is not None
-            else range(count))
+        indices = self.candidate_indices() if update_index else range(count)
         for index in indices:
             segment = (
                 self.path_points[(index + 1) % count]
@@ -566,7 +601,33 @@ class UnicornL1Node(Node):
         result = np.interp(wrapped, self.path_cumulative, closed_values)
         return result + laps * lap_change
 
+    def straight_run_ahead(
+            self, start_s, threshold, max_distance, samples=16):
+        """Distance ahead (capped at max_distance) over which |curvature|
+        stays below threshold, starting at start_s. Used only to scale
+        straight_lookahead_boost -- inert while that stays at its default
+        of 1.0."""
+        if max_distance <= 0.0:
+            return 0.0
+        sample_s = np.linspace(
+            start_s, start_s + max_distance, max(2, samples))
+        curvature = np.abs(self.interpolate_path(
+            self.path_curvature, sample_s))
+        over = np.nonzero(curvature > threshold)[0]
+        if len(over) == 0:
+            return max_distance
+        first = int(over[0])
+        if first == 0:
+            return 0.0
+        return float(sample_s[first] - start_s)
+
     def compute_command(self, x, y, yaw, speed):
+        if (self.last_position is not None
+                and math.hypot(x - self.last_position[0],
+                                y - self.last_position[1])
+                > self.position_jump_reset_distance):
+            self.nearest_index = None
+        self.last_position = (x, y)
         _, distance, path_heading, path_s, _ = self.nearest_path_state(
             x, y, update_index=True, reference_yaw=yaw)
         heading_error = self.angle_difference(path_heading, yaw)
@@ -575,7 +636,7 @@ class UnicornL1Node(Node):
                 'vehicle is %.2f m from path (limit %.2f m)'
                 % (distance, self.max_path_distance))
         if abs(heading_error) > self.max_heading_error:
-            raise RuntimeError(
+            raise HeadingErrorFault(
                 'heading error is %.1f deg (limit %.1f deg)'
                 % (math.degrees(abs(heading_error)),
                    math.degrees(self.max_heading_error)))
@@ -637,6 +698,35 @@ class UnicornL1Node(Node):
                     avoidance_limit, self.dynamic_speed_limit)
             command_speed = min(command_speed, avoidance_limit)
 
+        # A corner or an avoidance manoeuvre can still be limiting what the
+        # LiDAR can see forward for a moment after the path straightens back
+        # out. curvature_norm > 0 already marks "currently in a meaningful
+        # curve" (see the speed-profile scaling above); combine that with
+        # avoidance_active to mark "in a manoeuvre". The hold is triggered
+        # only on the falling edge -- the moment the vehicle *leaves* a
+        # manoeuvre -- not continuously while still inside one: the
+        # in-manoeuvre speed is already the curvature/lateral-error profile
+        # computed above, which legitimately varies (slows further into a
+        # tighter section, eases as it opens up); freezing it at whatever
+        # value it first took inside the manoeuvre would fight that, and
+        # if the vehicle starts already inside a manoeuvre zone (e.g. an
+        # obstacle right near the start pose) with previous_command_speed
+        # at its initial 0.0, continuously re-arming the hold produces a
+        # permanent zero/near-zero-speed deadlock -- both reproduced during
+        # testing. Once truly straight (in_manoeuvre False), acceleration
+        # is refused for post_maneuver_hold_time so the vehicle only speeds
+        # back up after a moment to look ahead with the path actually clear.
+        now = self.get_clock().now()
+        in_manoeuvre = bool(self.avoidance_active or curvature_norm > 0.0)
+        if in_manoeuvre:
+            self.maneuver_exit_time = None
+        else:
+            if self.maneuver_exit_time is None:
+                self.maneuver_exit_time = now
+            if ((now - self.maneuver_exit_time).nanoseconds * 1e-9
+                    < self.post_maneuver_hold_time):
+                command_speed = min(command_speed, self.previous_command_speed)
+
         if speed < 2.0:
             speed_for_l1 = self.clamp(
                 command_speed, max(0.0, speed - 1.0), speed + 1.0)
@@ -645,27 +735,21 @@ class UnicornL1Node(Node):
         curvature_scaler = (
             self.curvature_factor * mean_curvature * speed * speed)
         raw_l1 = self.m_l1 * speed_for_l1 - curvature_scaler + self.q_l1
+        if self.straight_lookahead_boost > 1.0:
+            straight_ahead = self.straight_run_ahead(
+                future_s, self.straight_curvature_threshold,
+                self.t_clip_max)
+            straight_fraction = self.clamp(
+                straight_ahead
+                / max(self.straight_reference_distance, 1e-3),
+                0.0, 1.0)
+            raw_l1 *= (
+                1.0
+                + (self.straight_lookahead_boost - 1.0) * straight_fraction)
         lower_l1 = max(
             self.t_clip_min,
             math.sqrt(2.0) * abs(future_lateral_error))
         l1_distance = self.clamp(raw_l1, lower_l1, self.t_clip_max)
-
-        # Independent geometric ceiling: don't let L1 reach past a point that
-        # would require more than maximum_preview_heading radians of heading
-        # change, using the sharpest curvature in a longer preview window (not
-        # just the narrow curvature_window used for curvature_scaler above).
-        # This is a proactive cap -- it engages before the car enters a tight
-        # bend, rather than only reacting once mean_curvature or the lateral
-        # error floor already reflect it.
-        preview_s = np.linspace(
-            future_s, future_s + self.l1_curvature_preview_distance, num=12)
-        preview_curvature = float(np.max(np.abs(
-            self.interpolate_path(self.path_curvature, preview_s))))
-        if preview_curvature > 1e-3:
-            curvature_ceiling = (
-                self.maximum_preview_heading / preview_curvature)
-            l1_distance = min(
-                l1_distance, max(lower_l1, curvature_ceiling))
 
         target_s = future_s + l1_distance
         target_x = float(self.interpolate_path(
@@ -707,14 +791,17 @@ class UnicornL1Node(Node):
             gain * self.filtered_heading_error
             + self.heading_kd * derivative)
 
-        # UNICORN's lateral-error steering scaling, clamped: unbounded growth
-        # (2x at 1m error and rising) is a positive-feedback risk once
-        # tracking starts to diverge, which ForzaETH's validated MAP
-        # controller avoids by scaling *speed*, not steering gain, on lateral
-        # error. Keep the corrective benefit but cap its multiplier.
-        steering *= min(
-            math.exp(math.log(2.0) * abs(future_lateral_error)),
-            self.max_lateral_error_steer_gain)
+        # Match UNICORN's lateral-error steering scaling and steering slew cap.
+        # The multiplier is 2**|lateral_error|, applied to the *entire*
+        # steering command (geometric L1 + heading P/D).  Left unbounded,
+        # any overshoot past the line keeps re-amplifying itself back and
+        # forth (each correction grows the next one's gain) -- an observed
+        # left-right wobble.  Capping the error this scales from keeps the
+        # intended "steer harder when far off-line" behaviour without
+        # letting the loop's own gain feed the oscillation.
+        scaling_error = min(
+            abs(future_lateral_error), self.lateral_steering_gain_cap)
+        steering *= math.exp(math.log(2.0) * scaling_error)
         steering = self.limit_steering(steering)
 
         return command_speed, steering, (
@@ -866,6 +953,7 @@ class UnicornL1Node(Node):
             command_speed, steering, geometry = self.compute_command(
                 x, y, yaw, speed)
             self.transform_fault_since = None
+            self.heading_fault_since = None
             self.publish_markers(geometry)
             self.last_solution_ok = True
             if not self.enabled:
@@ -908,6 +996,29 @@ class UnicornL1Node(Node):
             self.publish_stop()
             self.warn_throttled(
                 self.controller_label + ' safety stop: ' + str(error))
+        except HeadingErrorFault as error:
+            now = self.get_clock().now()
+            if self.heading_fault_since is None:
+                self.heading_fault_since = now
+            fault_age = (
+                now - self.heading_fault_since).nanoseconds * 1e-9
+            if (self.enabled
+                    and self.last_solution_ok
+                    and fault_age <= self.heading_error_grace):
+                self.publish_ackermann(
+                    self.drive_pub,
+                    self.previous_command_speed,
+                    self.previous_steering)
+                self.warn_throttled(
+                    self.controller_label
+                    + ' holding last command during transient heading '
+                    'fault: ' + str(error))
+                return
+            self.last_solution_ok = False
+            self.previous_command_speed = 0.0
+            self.publish_stop()
+            self.warn_throttled(
+                self.controller_label + ' safety stop: ' + str(error))
         except (RuntimeError, ValueError) as error:
             self.last_solution_ok = False
             self.previous_command_speed = 0.0
@@ -918,7 +1029,7 @@ class UnicornL1Node(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = UnicornL1Node()
+    node = WoongPpNode()
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:

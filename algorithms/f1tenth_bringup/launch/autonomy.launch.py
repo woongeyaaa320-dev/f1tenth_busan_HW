@@ -325,7 +325,8 @@ def generate_launch_description():
             'controller',
             default_value='unicorn_l1',
             description=(
-                'none, pure_pursuit, unicorn_l1, forza_map, mpc, or mpcc'),
+                'none, pure_pursuit (alias: racing_pp), unicorn_l1, '
+                'woong_pp, forza_map, mpc, or mpcc'),
         ),
         DeclareLaunchArgument(
             'speed',

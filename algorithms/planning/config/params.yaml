@@ -79,7 +79,7 @@ local_obstacle_planner_node:
     avoidance_before_time: 0.75
     avoidance_after_time: 0.40
     path_sample_spacing: 0.04
-    # 0.17 m vehicle lateral radius + 0.02 m wall margin.
+    # 0.17 m vehicle lateral radius + 0.01 m wall margin.
     map_clearance: 0.18
     vehicle_clearance_radius: 0.17
     vehicle_length: 0.58

@@ -69,6 +69,19 @@ class LocalObstaclePlannerNode(Node):
         self.declare_parameter('marker_publish_rate', 5.0)
         self.declare_parameter('scan_transform_delay', 0.08)
         self.declare_parameter('detection_range', 3.0)
+        # Confirmed via two independent live /scan captures (~15 minutes
+        # apart, vehicle having driven in between): a fixed cluster at
+        # 127-133 deg in the LiDAR frame, 3.7-4.0 cm range, angular width
+        # and distance unchanged both times. A real track obstacle would
+        # move relative to the vehicle as it drives; this did not, so it is
+        # something rigidly mounted on the vehicle itself sitting in the
+        # scan plane (a cable, bracket, or similar), not a track obstacle.
+        # Excluding only this narrow angle/range window -- not widening any
+        # clearance margin -- keeps every other direction's detection at
+        # full sensitivity.
+        self.declare_parameter('blind_spot_angle_min_deg', 125.0)
+        self.declare_parameter('blind_spot_angle_max_deg', 136.0)
+        self.declare_parameter('blind_spot_max_range', 0.20)
         self.declare_parameter('map_endpoint_clearance', 0.30)
         self.declare_parameter('map_registration_percentile', 60.0)
         self.declare_parameter('map_registration_margin', 0.08)
@@ -127,6 +140,12 @@ class LocalObstaclePlannerNode(Node):
         self.base_frame = self.get_parameter('base_frame_id').value
         self.detection_range = float(
             self.get_parameter('detection_range').value)
+        self.blind_spot_angle_min = math.radians(float(
+            self.get_parameter('blind_spot_angle_min_deg').value))
+        self.blind_spot_angle_max = math.radians(float(
+            self.get_parameter('blind_spot_angle_max_deg').value))
+        self.blind_spot_max_range = float(
+            self.get_parameter('blind_spot_max_range').value)
         self.map_endpoint_clearance = float(
             self.get_parameter('map_endpoint_clearance').value)
         self.map_registration_percentile = float(
@@ -522,6 +541,15 @@ class LocalObstaclePlannerNode(Node):
         ranges = ranges[valid]
         indices = indices[valid]
         angles = message.angle_min + indices * message.angle_increment
+        in_blind_spot = (
+            (angles >= self.blind_spot_angle_min)
+            & (angles <= self.blind_spot_angle_max)
+            & (ranges <= self.blind_spot_max_range))
+        if np.any(in_blind_spot):
+            keep = ~in_blind_spot
+            ranges = ranges[keep]
+            indices = indices[keep]
+            angles = angles[keep]
         laser_x = ranges * np.cos(angles)
         laser_y = ranges * np.sin(angles)
         scan_time = Time.from_msg(message.header.stamp)

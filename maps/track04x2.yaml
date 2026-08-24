@@ -1,0 +1,7 @@
+free_thresh: 0.25
+image: track04x2.pgm
+mode: trinary
+negate: 0
+occupied_thresh: 0.65
+origin: [-5.68, -2.18, 0.0]
+resolution: 0.1

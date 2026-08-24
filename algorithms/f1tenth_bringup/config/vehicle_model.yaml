@@ -2,8 +2,8 @@ vehicle:
   # Single source of truth for controller, simulator, and hardware adapters.
   # Values are taken from the current physical car configuration.
   wheelbase: 0.324
-  length: 0.58
-  width: 0.31
+  length: 0.55
+  width: 0.30
   laser_offset_x: 0.270
   laser_offset_z: 0.110
   max_steering_angle: 0.4189

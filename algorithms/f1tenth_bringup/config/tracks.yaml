@@ -13,6 +13,36 @@ tracks:
     raceline: track03_raceline.csv
     start: raceline
 
+  track04:
+    map_name: track04
+    map_ext: .pgm
+    raceline: track04_raceline.csv
+    start: raceline
+
+  track04x2:
+    map_name: track04x2
+    map_ext: .pgm
+    raceline: track04x2_raceline.csv
+    start: raceline
+
+  track05:
+    map_name: track05
+    map_ext: .pgm
+    raceline: track05_raceline.csv
+    start: raceline
+
+  busan:
+    map_name: busan
+    map_ext: .pgm
+    raceline: busan_raceline.csv
+    start: raceline
+
+  comp_track:
+    map_name: comp_track
+    map_ext: .pgm
+    raceline: comp_track_raceline.csv
+    start: raceline
+
   high_speed_test:
     map_name: high_speed_test
     map_ext: .pgm

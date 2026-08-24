@@ -61,7 +61,15 @@ def _launch_setup(context):
     if controller == 'none':
         return [LogInfo(msg='Controller disabled (controller:=none)')]
 
-    if controller == 'pure_pursuit':
+    pure_pursuit_family = {
+        'pure_pursuit': 'pure_pursuit_node',
+        'racing_pp': 'pure_pursuit_node',
+        'racing_v1_pp': 'racing_v1_pp_node',
+        'racing_v2_pp': 'racing_v2_pp_node',
+        'racing_v3_pp': 'racing_v3_pp_node',
+    }
+    if controller in pure_pursuit_family:
+        pp_executable = pure_pursuit_family[controller]
         profile_name = LaunchConfiguration('mpc_profile').perform(context)
         requested_speed = _parse_dynamic_speed(profile_name, maximum_speed)
         if requested_speed is None:
@@ -70,11 +78,11 @@ def _launch_setup(context):
                 '(for example speed_1.0).')
         return [
             LogInfo(msg=(
-                f'Controller=pure_pursuit speed={requested_speed:.2f}m/s')),
+                f'Controller={controller} speed={requested_speed:.2f}m/s')),
             Node(
                 package='control',
-                executable='pure_pursuit_node',
-                name='pure_pursuit_node',
+                executable=pp_executable,
+                name=pp_executable,
                 output='screen',
                 parameters=[
                     LaunchConfiguration('params_file').perform(context),
@@ -96,9 +104,15 @@ def _launch_setup(context):
                             'max_steering_angle').perform(context)),
                         'max_steering_rate': float(LaunchConfiguration(
                             'max_steering_rate').perform(context)),
-                        'max_lateral_acceleration': float(
-                            LaunchConfiguration(
-                                'max_lateral_acceleration').perform(context)),
+                        # max_lateral_acceleration is deliberately NOT wired
+                        # here: this shared launch arg's default (1.50) was
+                        # tuned for unicorn_l1/woong_pp, not this controller.
+                        # pure_pursuit_node.py's own default (2.6) is what
+                        # was actually validated for it; wiring this through
+                        # silently downgraded every real-car racing_pp run
+                        # to the lower cornering limit even without anyone
+                        # passing max_lateral_acceleration:= on the command
+                        # line.
                         'max_longitudinal_acceleration': float(
                             LaunchConfiguration(
                                 'max_longitudinal_acceleration').perform(
@@ -110,8 +124,31 @@ def _launch_setup(context):
                         'target_speed': requested_speed,
                         'max_speed': requested_speed,
                         'min_speed': min(0.25, requested_speed),
+                        # params.yaml's values for these two were not taking
+                        # effect at runtime (node kept its code defaults of
+                        # 60 deg / 1.0 m regardless of file content) --
+                        # setting them here, in the same inline-dict
+                        # mechanism already used for every other launch-arg
+                        # override above, sidesteps whatever was preventing
+                        # the file-based params from loading.
+                        'max_heading_error': 1.3090,
+                        # Effectively disabled per explicit request: the car
+                        # no longer needs to be near the loaded raceline to
+                        # enable. Note this is a controller tracking sanity
+                        # check, not the AEB/kill switch -- if enabled while
+                        # genuinely far from the path, the steering solve
+                        # will still aim at the nearest path point, which can
+                        # mean a large, sudden steering command.
+                        'max_path_distance': 1000.0,
                     },
                 ],
+            ),
+            Node(
+                package='control',
+                executable='kill_switch_node',
+                name='kill_switch_node',
+                output='screen',
+                parameters=[{'kill_switch_button': 6}],
             ),
         ]
 
@@ -149,7 +186,11 @@ def _launch_setup(context):
         # a second set of mode-specific gains.
         map_parameters = {
             't_clip_min': 0.9,
-            't_clip_max': 5.0,
+            # 5.0 (ForzaETH's tuned default, presumably for a larger
+            # reference track) is oversized for this ~22m track -- lowered
+            # to match the same correction applied to unicorn_l1_node's
+            # t_clip_max today.
+            't_clip_max': 3.0,
             'm_l1': 0.55,
             'q_l1': -0.03,
             'speed_lookahead': 0.25,
@@ -214,6 +255,13 @@ def _launch_setup(context):
                     'stop_on_collision': True,
                     'stop_on_emergency_stop': True,
                 }, map_parameters],
+            ),
+            Node(
+                package='control',
+                executable='kill_switch_node',
+                name='kill_switch_node',
+                output='screen',
+                parameters=[{'kill_switch_button': 6}],
             ),
         ]
 
@@ -291,12 +339,110 @@ def _launch_setup(context):
                 output='screen',
                 parameters=[parameters],
             ),
+            Node(
+                package='control',
+                executable='kill_switch_node',
+                name='kill_switch_node',
+                output='screen',
+                parameters=[{'kill_switch_button': 6}],
+            ),
+        ]
+
+    if controller == 'woong_pp':
+        # Same wiring as the unicorn_l1 branch above -- this is a separate
+        # controller variant (see woong_pp_node.py's module docstring
+        # for provenance/caveats), not a replacement for it. It reuses this
+        # project's own local_obstacle_planner_node.py and its already-tuned
+        # AEB/AMCL setup unchanged; only the controller node differs.
+        use_dynamic_speed_limit = True
+        profile_name = LaunchConfiguration('mpc_profile').perform(context)
+        requested_speed = _parse_dynamic_speed(profile_name, maximum_speed)
+        if requested_speed is None:
+            raise RuntimeError(
+                'UNICORN L1 (obs) requires mpc_profile:=speed_<m/s> '
+                '(for example speed_1.0).')
+        min_reference_speed = min(
+            requested_speed,
+            max(0.20, min(0.45, requested_speed * 0.40)),
+        )
+        avoidance_value = LaunchConfiguration(
+            'avoidance_speed_limit').perform(context)
+        avoidance_speed_limit = (
+            requested_speed if avoidance_value == 'auto'
+            else float(avoidance_value))
+        if avoidance_speed_limit <= 0.0:
+            raise RuntimeError(
+                'avoidance_speed_limit must be auto or a positive m/s value')
+        parameters = {
+            'enabled': _as_bool(
+                LaunchConfiguration('enabled').perform(context)),
+            'global_frame_id': LaunchConfiguration(
+                'global_frame_id').perform(context),
+            'odom_frame_id': LaunchConfiguration(
+                'odom_frame_id').perform(context),
+            'base_frame_id': LaunchConfiguration(
+                'base_frame_id').perform(context),
+            'odom_topic': LaunchConfiguration('odom_topic').perform(context),
+            'drive_topic': LaunchConfiguration('drive_topic').perform(context),
+            'collision_topic': LaunchConfiguration(
+                'collision_topic').perform(context),
+            'emergency_stop_topic': LaunchConfiguration(
+                'emergency_stop_topic').perform(context),
+            'target_speed': requested_speed,
+            'max_speed': requested_speed,
+            'max_lateral_acceleration': float(LaunchConfiguration(
+                'max_lateral_acceleration').perform(context)),
+            'max_longitudinal_acceleration': float(LaunchConfiguration(
+                'max_longitudinal_acceleration').perform(context)),
+            'max_longitudinal_deceleration': float(LaunchConfiguration(
+                'max_longitudinal_deceleration').perform(context)),
+            'wheelbase': float(LaunchConfiguration(
+                'wheelbase').perform(context)),
+            'max_steering_angle': float(LaunchConfiguration(
+                'max_steering_angle').perform(context)),
+            'max_steering_rate': float(LaunchConfiguration(
+                'max_steering_rate').perform(context)),
+            'transform_fault_grace': float(LaunchConfiguration(
+                'transform_fault_grace').perform(context)),
+            'avoidance_speed_limit': avoidance_speed_limit,
+            'use_dynamic_speed_limit': use_dynamic_speed_limit,
+            'min_reference_speed': min_reference_speed,
+            'min_command_speed': float(LaunchConfiguration(
+                'min_command_speed').perform(context)),
+            # This fork's own default for heading (60deg) was tuned in sim,
+            # where AMCL pose is effectively ground truth; matched to
+            # racing_pp's real-car-tuned value.
+            'max_heading_error': 1.3090,
+            # Effectively disabled per explicit request -- see the matching
+            # racing_pp override above for what this trades away.
+            'max_path_distance': 1000.0,
+        }
+        return [
+            LogInfo(msg=(
+                f'Controller={controller} speed={requested_speed:.2f}m/s '
+                f'corner_min={min_reference_speed:.2f}m/s '
+                '(sim-only-validated obstacle-tuning fork, low speed first)')),
+            Node(
+                package='control',
+                executable='woong_pp_node',
+                name='woong_pp_node',
+                output='screen',
+                parameters=[parameters],
+            ),
+            Node(
+                package='control',
+                executable='kill_switch_node',
+                name='kill_switch_node',
+                output='screen',
+                parameters=[{'kill_switch_button': 6}],
+            ),
         ]
 
     if controller not in ('mpc', 'mpcc'):
         raise RuntimeError(
             f'Unknown controller {controller!r}; use none, pure_pursuit, '
-            'unicorn_l1, forza_map, mpc, or mpcc.')
+            'unicorn_l1, woong_pp, racing_v1_pp, racing_v2_pp, racing_v3_pp, '
+            'forza_map, mpc, or mpcc.')
 
     config_path = LaunchConfiguration('mpc_params_file').perform(context)
     profile_name = LaunchConfiguration('mpc_profile').perform(context)
@@ -389,7 +535,9 @@ def generate_launch_description():
             'controller',
             default_value='pure_pursuit',
             description=(
-                'none, pure_pursuit, unicorn_l1, forza_map, mpc, or mpcc'),
+                'none, pure_pursuit, unicorn_l1, woong_pp, racing_v1_pp, '
+                'racing_v2_pp, racing_v3_pp, forza_map, '
+                'mpc, or mpcc'),
         ),
         DeclareLaunchArgument(
             'mpc_profile',

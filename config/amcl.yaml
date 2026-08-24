@@ -4,7 +4,7 @@ amcl:
 
     global_frame_id: map
     odom_frame_id: odom
-    base_frame_id: ego_racecar/base_link
+    base_frame_id: base_link
     scan_topic: /scan
     robot_model_type: nav2_amcl::DifferentialMotionModel
 
@@ -22,8 +22,13 @@ amcl:
 
     alpha1: 0.2
     alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
+    # alpha3/alpha4 model odometry noise caused by the robot's *translational*
+    # motion. A car-like (Ackermann) vehicle approximated with
+    # DifferentialMotionModel slips more along this axis at speed than the
+    # diff-drive model assumes, so keep some slack here instead of trusting
+    # the raw wheel odometry as tightly as the 0.2 default did.
+    alpha3: 0.3
+    alpha4: 0.3
     alpha5: 0.2
 
     min_particles: 500
@@ -31,8 +36,13 @@ amcl:
     pf_err: 0.05
     pf_z: 0.99
     resample_interval: 1
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    # Previously 0.0/0.0 -- recovery fully disabled. Once high-speed slip
+    # pushed the particle cloud away from the true pose, there was no
+    # mechanism to inject fresh hypotheses and re-converge; the estimate
+    # stayed wrong until the next lucky resample. These are the standard
+    # Nav2 AMCL example values, not aggressive tuning.
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
 
     update_min_d: 0.05
     update_min_a: 0.05

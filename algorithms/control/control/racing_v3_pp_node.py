@@ -1,3 +1,18 @@
+"""racing_v3_pp: active-tuning branch forked from racing_v2_pp_node.py
+(2026-08-24). Speed/accel/decel behavior is unchanged from v2 (still the
+2026-08-23 grip-test-measured values) -- v3's actual changes are in the
+shared local_obstacle_planner_node.py / planning/config/params.yaml
+(faster scan processing, detection-latency-aware planning horizon,
+realistic AEB deceleration), not in this file's own speed control.
+racing_v2_pp_node.py stays as the prior reference/fallback; edit this
+file (not v2) for further obstacle-avoidance-driven tuning.
+
+Cornering/accel/decel limits below are set from the 2026-08-23 surface
+grip test (scripts/surface_grip_test.py + analyze_grip_bag.py), not
+guessed. See scripts/README.md for how to re-measure if the tires or
+surface change.
+"""
+
 import math
 
 import rclpy
@@ -14,9 +29,9 @@ from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
-class PurePursuitNode(Node):
+class RacingV3PpNode(Node):
     def __init__(self):
-        super().__init__('pure_pursuit_node')
+        super().__init__('racing_v3_pp_node')
 
         self.declare_parameter('drive_mode', 'sim')
         self.declare_parameter('enabled', False)
@@ -62,14 +77,42 @@ class PurePursuitNode(Node):
         # vehicle limits, not map-specific gains: path curvature determines
         # corner speed, while the longitudinal limits create a braking-aware
         # speed envelope before the corner.
-        # Lowered from an earlier 4.0: that value assumed grip this track's
-        # actual (untested, likely lower-friction) surface has not verified.
-        # Tune upward empirically once real max lateral acceleration is
-        # measured; better to be conservative first than find the limit via
-        # a wall.
-        self.declare_parameter('max_lateral_acceleration', 2.6)
-        self.declare_parameter('max_longitudinal_acceleration', 2.0)
-        self.declare_parameter('max_longitudinal_deceleration', 4.0)
+        # v1 ran conservative at 2.6 while base_link/AMCL/kill-switch bugs
+        # were still being found and fixed; then raised blind to 4.0 to
+        # start probing real cornering speed. 2026-08-23's surface_grip_test
+        # (scripts/surface_grip_test.py + analyze_grip_bag.py) measured the
+        # real slip onset directly on the practice-track surface: yaw-rate
+        # ratio broke at a_y=5.54 m/s^2, giving 4.43 (80% margin).
+        # 2026-08-24's grip_test_busan bag re-measured this on the actual
+        # Busan/BEXCO competition venue surface (different friction from the
+        # practice track -- must be re-measured whenever tires or surface
+        # change): slip onset a_y=4.09 m/s^2 at cmd v=2.20 m/s, ratio held
+        # near baseline (~1.05-1.11) below that. 3.27 (80% margin) is lower
+        # than the practice-track number, so it's the tighter constraint --
+        # use it for anything actually run on the competition surface.
+        self.declare_parameter('max_lateral_acceleration', 3.27)
+        # Busan grip test's step-up events: n=40, median 1.19 m/s^2, max
+        # 2.10 (partly contaminated by deadman/teleop mixing in mid-test,
+        # so noisier than the lateral number above). 0.95 = 80% of median.
+        # Practice-track measurement was 1.8; use the lower, venue-specific
+        # number for the actual competition surface.
+        self.declare_parameter('max_longitudinal_acceleration', 0.95)
+        # Busan grip test's braking events: only n=2, median 6.50 m/s^2, max
+        # 9.60 -- small sample, lower confidence than the practice-track
+        # measurement (3.04, n larger). 5.20 = 80% of median. Notably
+        # *higher* than the practice-track number (this surface brakes
+        # harder, not less, unlike the other two dimensions), so this one
+        # actually loosens the old assumption rather than tightening it --
+        # worth a re-test with more braking events before fully trusting it.
+        self.declare_parameter('max_longitudinal_deceleration', 5.20)
+        # IMPORTANT: do not override this via max_longitudinal_deceleration:=
+        # with an unmeasured value (e.g. the 8.0 used in earlier real-car
+        # runs) -- that made curvature_speed_limit()'s braking preview below
+        # believe it could stop harder than the car physically can, so it
+        # started braking too late and had to drop speed in what felt like a
+        # single hard step at corner entry (reported: 5->2 m/s "step" on
+        # track05). 3.04 is measured; trust it.
+        #
         # curvature_speed_limit()'s braking preview computes the exact
         # minimum distance needed at max_longitudinal_deceleration -- zero
         # margin for control-loop discretization, actuator lag, or the
@@ -78,7 +121,13 @@ class PurePursuitNode(Node):
         # then get discovered too late to fully brake for, so the car enters
         # the corner over the curvature-safe speed and runs wide into the
         # outer wall. Scaling the preview window out start braking earlier.
-        self.declare_parameter('speed_limit_preview_margin', 1.35)
+        # Raised 1.35->1.7: track05-class tracks are short/tight enough that
+        # corner entries follow straights almost immediately: more lead time
+        # here is what actually turns a hard 1-second drop into a longer,
+        # gentler one, since the physical deceleration rate itself (3.04) is
+        # already the measured real limit and can't be raised further
+        # without new grip data.
+        self.declare_parameter('speed_limit_preview_margin', 1.70)
         self.declare_parameter('curvature_sample_distance', 0.25)
         self.declare_parameter('curvature_floor', 0.02)
         self.declare_parameter('use_dynamic_speed_limit', True)
@@ -779,7 +828,7 @@ class PurePursuitNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PurePursuitNode()
+    node = RacingV3PpNode()
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException, RCLError):
