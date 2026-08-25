@@ -121,6 +121,14 @@ class LocalObstaclePlannerNode(Node):
         self.declare_parameter('wheelbase', 0.33)
         self.declare_parameter('max_steering_angle', 0.4189)
         self.declare_parameter('obstacle_safety_margin', 0.02)
+        # candidate_is_safe() previously accepted any candidate with
+        # clearance >= 0.0. Candidate scoring always prefers the smallest
+        # feasible offset, so a bare >=0 acceptance test means the offset
+        # actually commanded routinely has only a few millimetres of
+        # theoretical clearance -- real UNICORN L1 tracking error alone can
+        # then clip the obstacle. This requires genuine buffer on top of
+        # every other margin already folded into the clearance computation.
+        self.declare_parameter('minimum_required_clearance', 0.04)
         self.declare_parameter('aeb_corridor_half_width', 0.19)
         self.declare_parameter('aeb_reaction_time', 0.12)
         self.declare_parameter('aeb_max_deceleration', 2.0)
@@ -261,6 +269,8 @@ class LocalObstaclePlannerNode(Node):
             math.tan(self.max_steering_angle) / self.wheelbase)
         self.obstacle_margin = float(
             self.get_parameter('obstacle_safety_margin').value)
+        self.minimum_required_clearance = float(
+            self.get_parameter('minimum_required_clearance').value)
         self.aeb_half_width = float(
             self.get_parameter('aeb_corridor_half_width').value)
         self.aeb_reaction_time = float(
@@ -934,32 +944,42 @@ class LocalObstaclePlannerNode(Node):
         wall_margin = max(
             0.0, self.map_clearance - self.vehicle_clearance)
         map_extra_clearance = minimum_map_clearance - wall_margin
-        if map_extra_clearance < 0.0:
+        if map_extra_clearance < self.minimum_required_clearance:
             return False, map_extra_clearance, 'map'
 
         minimum_obstacle_clearance = float('inf')
         for obstacle in obstacles:
             obstacle_margin = self.effective_obstacle_margin(obstacle)
+            candidate_minimums = []
             surface_points = obstacle.get('surface_points')
             if surface_points is not None and len(surface_points):
-                minimum = minimum_surface_footprint_clearance(
+                candidate_minimums.append(minimum_surface_footprint_clearance(
                     local,
                     surface_points,
                     self.vehicle_length,
                     self.vehicle_width,
                     obstacle_margin
-                    + self.candidate_clearance_buffer)
-            else:
-                minimum = minimum_surface_footprint_clearance(
-                    local,
-                    np.asarray([obstacle['center']]),
-                    self.vehicle_length + 2.0 * obstacle['radius'],
-                    self.vehicle_width + 2.0 * obstacle['radius'],
-                    obstacle_margin
-                    + self.candidate_clearance_buffer)
+                    + self.candidate_clearance_buffer))
+            # Always also check a radius-inflated circle at the obstacle's
+            # centre, even when surface_points is present. A track object is
+            # usually only partially visible on the first confirmed frame
+            # (one near edge/corner) -- checking only those few points can
+            # accept a candidate that is safe against the sliver actually
+            # seen so far but not against the object's true, still-unseen
+            # extent. obstacle['radius'] already floors at
+            # obstacle_default_radius regardless of what has been observed,
+            # so this circle check catches that gap.
+            candidate_minimums.append(minimum_surface_footprint_clearance(
+                local,
+                np.asarray([obstacle['center']]),
+                self.vehicle_length + 2.0 * obstacle['radius'],
+                self.vehicle_width + 2.0 * obstacle['radius'],
+                obstacle_margin
+                + self.candidate_clearance_buffer))
+            minimum = min(candidate_minimums)
             minimum_obstacle_clearance = min(
                 minimum_obstacle_clearance, minimum)
-            if minimum < 0.0:
+            if minimum < self.minimum_required_clearance:
                 return False, minimum, 'obstacle'
         if map_extra_clearance <= minimum_obstacle_clearance:
             return True, map_extra_clearance, 'map'

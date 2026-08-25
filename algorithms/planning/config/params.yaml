@@ -48,9 +48,13 @@ local_obstacle_planner_node:
     obstacle_memory_seconds: 0.5
     obstacle_confirmation_frames: 3
     obstacle_match_distance: 0.35
-    # 0.20 x 0.12 m obstacle footprint의 외접원에 가까운 기본 반경.
-    obstacle_default_radius: 0.11
-    obstacle_max_radius: 0.12
+    # 0.20 x 0.20 m obstacle footprint(config/sim.yaml obstacle_length/width)의
+    # 외접원 반경(sqrt(0.2^2+0.2^2)/2 ~= 0.1414m)에 여유를 더한 값. 이전에는
+    # 0.20 x 0.12 m 기준(0.12m)으로 맞춰져 있었는데, obstacle_width를 0.20으로
+    # 키운 뒤 이 값을 같이 안 올려서 대각선으로 보이는 물체의 실제 폭을
+    # 과소평가 -> 회피 오프셋 부족 -> 충돌로 이어졌다(재현: obstacle_seed=42).
+    obstacle_default_radius: 0.13
+    obstacle_max_radius: 0.15
     obstacle_marker_radius_scale: 1.0
     obstacle_lookahead: 3.2
     # Speed-adaptive horizon = reaction + v^2/(2a) + margin, bounded here.
@@ -79,15 +83,29 @@ local_obstacle_planner_node:
     avoidance_before_time: 0.75
     avoidance_after_time: 0.40
     path_sample_spacing: 0.04
-    # 0.17 m vehicle lateral radius + 0.01 m wall margin.
-    map_clearance: 0.18
-    vehicle_clearance_radius: 0.17
+    # vehicle_clearance_radius = 0.155 m physical half-width + ~0.065 m
+    # budget for real UNICORN L1 tracking error during a lateral avoidance
+    # bump (L1 lookahead lag, steering-rate limit). Debug telemetry on
+    # busan obstacle_seed=42 showed the previous 0.17 m (only 1.5 cm above
+    # the physical half-width) let candidate_is_safe() accept offsets with
+    # as little as 2 mm of theoretical clearance -- candidate scoring always
+    # prefers the smallest feasible offset, so that razor-thin theoretical
+    # margin is exactly what gets commanded, and real tracking error alone
+    # was enough to clip the obstacle. map_clearance kept slightly above
+    # vehicle_clearance_radius for a small explicit wall margin.
+    map_clearance: 0.24
+    vehicle_clearance_radius: 0.22
     vehicle_length: 0.58
     vehicle_width: 0.31
     # Ackermann geometric feasibility: kappa <= tan(delta_max) / wheelbase.
     wheelbase: 0.324
     max_steering_angle: 0.4189
     obstacle_safety_margin: 0.01
+    # candidate_is_safe() rejects a candidate below this clearance instead of
+    # accepting anything >= 0.  Candidate scoring always prefers the smallest
+    # feasible offset, so without this floor the offset actually commanded
+    # routinely carried only a few millimetres of theoretical clearance.
+    minimum_required_clearance: 0.04
 
     # Performance-oriented AEB: confirmed dense clusters only.  Physical
     # footprint collision and no-feasible-path stops remain unchanged.
