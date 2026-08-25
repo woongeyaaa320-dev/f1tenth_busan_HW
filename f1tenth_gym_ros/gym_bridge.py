@@ -105,6 +105,9 @@ class GymBridge(Node):
         self.declare_parameter('random_obstacle_seed', -1)
         self.declare_parameter('randomize_obstacles_on_reset', False)
         self.declare_parameter('randomize_obstacles_on_lap', True)
+        # Only every Nth completed lap gets a new layout; 1 = every lap
+        # (previous behavior).
+        self.declare_parameter('randomize_obstacles_lap_interval', 1)
         self.declare_parameter(
             'obstacle_path_csv',
             '/sim_ws/src/planning/waypoints/track03_centerline.csv')
@@ -544,6 +547,10 @@ class GymBridge(Node):
         if not self.random_obstacles_active:
             return
         if not self.get_parameter('randomize_obstacles_on_lap').value:
+            return
+        interval = max(1, int(
+            self.get_parameter('randomize_obstacles_lap_interval').value))
+        if self.obstacle_lap_tracker.lap_count % interval != 0:
             return
 
         try:

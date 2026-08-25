@@ -123,7 +123,22 @@ class UnicornL1Node(Node):
         # UNICORN controller.yaml defaults. Distance-window curvature sampling
         # replaces its waypoint-index window so behavior is path-resolution
         # independent.
-        self.declare_parameter('t_clip_min', 0.70)
+        # Raised from 0.70 (measured, busan track): at this sim's 2.0 m/s
+        # target speed, raw_l1 (m_l1*speed - curvature_scaler + q_l1) comes
+        # out below 0.70 almost everywhere -- per-cycle telemetry showed l1
+        # pinned at the floor through nearly an entire lap, even on straight
+        # sections, so the "adaptive" formula was in practice a constant,
+        # short 0.70 m lookahead. Pure pursuit with too-short L1 is known to
+        # overreact to curvature/heading error; this reproduced as
+        # continuous steering oscillation (repeatedly hitting the steering
+        # limit) both on plain corners and, worse, during obstacle-avoidance
+        # bumps, occasionally causing a collision. Raising the floor to 1.00
+        # measurably reduced it (no more steering-limit saturation on the
+        # same corners; the seed=43 obstacle that reliably collided before
+        # cleared cleanly across multiple laps after this change), at the
+        # cost of higher lateral tracking error (more preview -> cuts
+        # corners more).
+        self.declare_parameter('t_clip_min', 1.00)
         # 8.00 (UNICORN's original default) is over 1/3 of track03's ~23m
         # lap: on a straight run-up (near-zero curvature, so the
         # l1_curvature_preview_distance ceiling below doesn't engage) the L1

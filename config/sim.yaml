@@ -73,6 +73,8 @@ bridge:
     random_obstacle_seed: -1
     randomize_obstacles_on_reset: false
     randomize_obstacles_on_lap: true
+    # Keep one obstacle layout for 3 complete laps before moving to the next.
+    randomize_obstacles_lap_interval: 3
     # Match the physical failure mode: contact latches zero command until the
     # pose is reset or a new process starts.
     stop_vehicle_on_collision: true
