@@ -38,8 +38,15 @@ services:
       - ROS_LOCALHOST_ONLY=0
       # CLI discovery is direct; no stale ros2 daemon survives a stopped run.
       - ROS2CLI_NO_DAEMON=1
-      # Avoid stale Fast DDS SHM locks after Ctrl+C; simulation uses UDP only.
+      # Same RMW as the onboard vehicle (see f1tenth-onboard README) so a
+      # laptop can share one ROS graph with the real car over WiFi. Inert
+      # while RMW_IMPLEMENTATION stays Fast DDS; kept for an easy revert.
       - FASTRTPS_DEFAULT_PROFILES_FILE=/sim_ws/src/f1tenth_gym_ros/config/fastdds_udp.xml
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      # CYCLONEDDS_NETWORK_INTERFACE is per-machine (WiFi adapter name
+      # differs per laptop) -- set it in a local, gitignored .env file, not
+      # here. See .env.example and usage.md.
+      - 'CYCLONEDDS_URI=<CycloneDDS><Domain Id="any"><General><Interfaces><NetworkInterface name="${CYCLONEDDS_NETWORK_INTERFACE:?Set CYCLONEDDS_NETWORK_INTERFACE in a local .env file -- copy .env.example, then fill in your WiFi interface name (see ip -br addr)}"/></Interfaces><AllowMulticast>spdp</AllowMulticast><MaxMessageSize>1400B</MaxMessageSize></General><Internal><SocketReceiveBufferSize min="2MB"/></Internal></Domain></CycloneDDS>'
       - LIBGL_ALWAYS_SOFTWARE=1
       - MESA_GL_VERSION_OVERRIDE=3.3
       - MESA_GLSL_VERSION_OVERRIDE=330

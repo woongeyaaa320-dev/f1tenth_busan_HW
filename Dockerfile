@@ -32,7 +32,8 @@ RUN apt-get update --fix-missing && \
                        python3-pip \
                        libeigen3-dev \
                        tmux \
-                       ros-humble-rviz2
+                       ros-humble-rviz2 \
+                       ros-humble-rmw-cyclonedds-cpp
 RUN apt-get -y dist-upgrade
 
 # Python dependencies for f1tenth_gym

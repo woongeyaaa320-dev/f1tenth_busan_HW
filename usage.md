@@ -345,6 +345,38 @@ rocker 또는 docker run
 
 # 7. 컨테이너 실행 명령어
 
+## 7.0 실차와 같은 네트워크에서 통신하려면 (CycloneDDS, 최초 1회)
+
+실차(Jetson)는 `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` + WiFi 튜닝된
+CycloneDDS 설정을 씁니다(자세한 배경은 `f1tenth-onboard` 레포 README 참고).
+시뮬레이터를 실차와 같은 ROS 그래프에 붙여서(같은 `ROS_DOMAIN_ID=30`으로
+RViz 등을 같이 쓰려는 경우) 노트북도 같은 RMW로 맞춰야 서로 안정적으로
+보입니다. `docker-compose.yml`이 이미 `RMW_IMPLEMENTATION`/`CYCLONEDDS_URI`를
+설정하지만, WiFi 인터페이스 이름은 컴퓨터마다 달라서 `.env` 파일로 각자
+따로 설정합니다(`.env`는 gitignore 대상이라 커밋되지 않음):
+
+```bash
+cp .env.example .env
+ip -br addr        # UP 상태이고 IP가 있는 WiFi 인터페이스 이름 확인
+```
+
+`.env` 파일을 열어 `CYCLONEDDS_NETWORK_INTERFACE`를 방금 확인한 이름으로
+바꿉니다 (예: `wlan0`, `wlp3s0`). 이 값을 안 채우면 `docker compose up`
+자체가 명확한 에러 메시지와 함께 실패합니다(조용히 잘못된 인터페이스로
+뜨는 것보다 낫습니다).
+
+Dockerfile이 `ros-humble-rmw-cyclonedds-cpp`를 새로 설치하므로, 이 변경을
+받은 뒤엔 이미지도 다시 빌드해야 합니다:
+
+```bash
+docker compose build
+```
+
+실차와 통신할 필요 없이 로컬에서만 시뮬레이션을 돌린다면 이 설정은
+꼭 정확할 필요는 없습니다(같은 컴퓨터 안에서는 인터페이스가 뭐든 서로
+찾습니다) — 다만 `.env`는 여전히 채워야 `docker compose up`이 실패하지
+않습니다.
+
 ## 7.1 GPU 없는 PC
 
 ```bash
