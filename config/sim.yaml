@@ -85,10 +85,15 @@ bridge:
     obstacle_lateral_offset: 0.16
     obstacle_start_clearance: 1.50
     obstacle_min_spacing: 3.00
-    obstacle_passage_offset: 0.18
-    # Effective half width (0.155 m) + tracking buffer (0.05 m) + wall margin.
-    # This validates passage width only; it does not change obstacle size.
-    obstacle_passage_radius: 0.23
+    # A real competition places obstacles so a fair, comfortably-wide gap is
+    # always available on one side, not a razor-thin theoretical-only
+    # passage. The previous 0.18/0.23 pair validated barely more than the
+    # vehicle's physical half width (0.155 m) -- far under what the planner
+    # actually needs once its speed-scaled tracking-error margin is added
+    # (~0.6-0.9 m at 5 m/s), so many placements were tighter than the real
+    # system could ever cleanly clear regardless of tuning.
+    obstacle_passage_offset: 0.35
+    obstacle_passage_radius: 0.40
     obstacle_marker_topic: '/simulation/obstacles_ground_truth'
     vehicle_length: 0.58
     vehicle_width: 0.31

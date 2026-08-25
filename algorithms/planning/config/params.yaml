@@ -31,7 +31,12 @@ local_obstacle_planner_node:
     marker_publish_rate: 5.0
     scan_transform_delay: 0.08
 
-    detection_range: 6.0
+    # Fixed distance -> reaction time shrinks as speed rises (busan
+    # obstacle collision reproduced at speed=5.0m/s: only 1.6s elapsed
+    # between the first AVOIDING log and impact, vs 1.5s headroom at the
+    # previously-validated 4.0m/s). Raised alongside maximum_planning_horizon
+    # below to keep roughly 1.5s of visibility up to ~5.3m/s.
+    detection_range: 8.0
     # Ignore map/scan registration residuals near mapped walls. process_scan()
     # separately adds one diagonal 0.05 m map cell (~0.071 m) as raster
     # tolerance.  A 0.12 m baseline therefore gives an effective nominal gate
@@ -58,7 +63,9 @@ local_obstacle_planner_node:
     obstacle_marker_radius_scale: 1.0
     obstacle_lookahead: 3.2
     # Speed-adaptive horizon = reaction + v^2/(2a) + margin, bounded here.
-    maximum_planning_horizon: 6.0
+    # Raised with detection_range above so the extra visibility distance is
+    # actually usable by avoidance-path planning, not wasted.
+    maximum_planning_horizon: 8.0
     planning_reaction_time: 0.25
     planning_deceleration: 4.0
     planning_distance_margin: 0.50
@@ -130,6 +137,13 @@ local_obstacle_planner_node:
     maximum_planning_speed: 5.5
     minimum_avoidance_speed: 1.00
     max_lateral_acceleration: 1.50
+    # Curvature-scaled lateral-G blend; see local_obstacle_planner_node's
+    # speed-limit publisher for why one constant is insufficient (busan
+    # speed=5.0m/s reproduction: collisions in tight-curvature sections
+    # despite gentle bends being clean at the same ceiling).
+    tight_lateral_acceleration: 3.00
+    gentle_curvature_threshold: 0.15
+    tight_curvature_threshold: 0.55
     candidate_curvature_weight: 0.35
     candidate_clearance_weight: 0.10
     curvature_percentile: 85.0

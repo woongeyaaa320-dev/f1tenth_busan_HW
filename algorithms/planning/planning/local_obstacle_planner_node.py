@@ -150,6 +150,16 @@ class LocalObstaclePlannerNode(Node):
         self.declare_parameter('maximum_planning_speed', 5.5)
         self.declare_parameter('minimum_avoidance_speed', 0.60)
         self.declare_parameter('max_lateral_acceleration', 1.50)
+        # Same curvature-scaled lateral-G blend as unicorn_l1_node's
+        # curvature_scaled_lateral_limit() -- kept in sync so the
+        # avoidance speed cap published here does not fight the
+        # controller's own curvature-based speed profile. Reproduced on
+        # busan at speed=5.0 m/s: a single 4.0 m/s^2 ceiling held cleanly
+        # through gentle bends but produced collisions in tight-curvature
+        # sections.
+        self.declare_parameter('tight_lateral_acceleration', 3.00)
+        self.declare_parameter('gentle_curvature_threshold', 0.15)
+        self.declare_parameter('tight_curvature_threshold', 0.55)
         self.declare_parameter('candidate_curvature_weight', 0.35)
         self.declare_parameter('candidate_clearance_weight', 0.10)
         self.declare_parameter('curvature_percentile', 90.0)
@@ -313,6 +323,19 @@ class LocalObstaclePlannerNode(Node):
             self.get_parameter('minimum_avoidance_speed').value)
         self.max_lateral_acceleration = float(
             self.get_parameter('max_lateral_acceleration').value)
+        self.tight_lateral_acceleration = float(
+            self.get_parameter('tight_lateral_acceleration').value)
+        self.gentle_curvature_threshold = float(
+            self.get_parameter('gentle_curvature_threshold').value)
+        self.tight_curvature_threshold = float(
+            self.get_parameter('tight_curvature_threshold').value)
+        if self.tight_lateral_acceleration <= 0.0:
+            raise RuntimeError('tight_lateral_acceleration must be positive')
+        if (self.tight_curvature_threshold
+                < self.gentle_curvature_threshold):
+            raise RuntimeError(
+                'tight_curvature_threshold must be >= '
+                'gentle_curvature_threshold')
         self.candidate_curvature_weight = float(
             self.get_parameter('candidate_curvature_weight').value)
         self.candidate_clearance_weight = float(
@@ -351,6 +374,7 @@ class LocalObstaclePlannerNode(Node):
         self.latest_scan_generation = 0
         self.last_aeb_scan_generation = -1
         self.aeb_detection_count = 0
+        self.aeb_stop_first_seen = None
         self.tracked_obstacles = []
         self.next_obstacle_id = 0
         self.last_safe_path = None
@@ -772,6 +796,21 @@ class LocalObstaclePlannerNode(Node):
             margin += self.dynamic_margin_gain * closing_speed
         return margin
 
+    def effective_minimum_required_clearance(self):
+        """Return the minimum-clearance floor candidate_is_safe() enforces.
+
+        Scales with speed for the same reason effective_obstacle_margin()
+        above does, but this floor also gates *wall* clearance, which never
+        got that treatment when obstacle clearance did. Reproduced on busan
+        at speed=5.0m/s: candidate_is_safe() rejected every candidate near a
+        tight obstacle+wall pinch point (NO_COLLISION_FREE_PATH, correctly
+        emergency-stopping), then accepted the next cycle's candidate the
+        moment it barely cleared the fixed 0.04m floor -- real tracking
+        error at that speed was enough to still clip the wall.
+        """
+        return self.minimum_required_clearance + self.speed_clearance_gain * max(
+            0.0, self.speed - self.speed_clearance_baseline)
+
     def _frenet_extent(self, points):
         """Project a set of XY points into this obstacle's local Frenet frame.
 
@@ -965,7 +1004,8 @@ class LocalObstaclePlannerNode(Node):
         wall_margin = max(
             0.0, self.map_clearance - self.vehicle_clearance)
         map_extra_clearance = minimum_map_clearance - wall_margin
-        if map_extra_clearance < self.minimum_required_clearance:
+        required_clearance = self.effective_minimum_required_clearance()
+        if map_extra_clearance < required_clearance:
             return False, map_extra_clearance, 'map'
 
         minimum_obstacle_clearance = float('inf')
@@ -1000,7 +1040,7 @@ class LocalObstaclePlannerNode(Node):
             minimum = min(candidate_minimums)
             minimum_obstacle_clearance = min(
                 minimum_obstacle_clearance, minimum)
-            if minimum < self.minimum_required_clearance:
+            if minimum < required_clearance:
                 return False, minimum, 'obstacle'
         if map_extra_clearance <= minimum_obstacle_clearance:
             return True, map_extra_clearance, 'map'
@@ -1475,18 +1515,96 @@ class LocalObstaclePlannerNode(Node):
             self.aeb_detection_count = (
                 self.aeb_detection_count + 1 if raw_path_stop else 0)
             self.last_aeb_scan_generation = self.latest_scan_generation
+        # aeb_confirmation_frames filters a single noisy scan, but at
+        # scan_process_rate=20Hz that wait is itself ~0.15s -- reproduced on
+        # busan at speed=5.0m/s: emergency_clearance was already -0.13m
+        # (path already overlapping a confirmed, clustered obstacle, not a
+        # single noisy point) when AEB_STOP first logged, and the vehicle
+        # collided 0.27s later while still inside that confirmation wait.
+        # aeb_critical_reaction_time bounds that wait by elapsed time
+        # instead of frame count: once the path has stayed continuously
+        # overlapped for that long, further waiting only costs stopping
+        # distance without adding confidence -- the clearance is measured
+        # against clustered points, not a single raw return.
+        now = self.get_clock().now()
+        if raw_path_stop:
+            if self.aeb_stop_first_seen is None:
+                self.aeb_stop_first_seen = now
+            stop_elapsed = (
+                now - self.aeb_stop_first_seen).nanoseconds * 1e-9
+        else:
+            self.aeb_stop_first_seen = None
+            stop_elapsed = 0.0
         critical_stop = bool(
-            self.aeb_detection_count >= self.aeb_confirmation_frames)
+            self.aeb_detection_count >= self.aeb_confirmation_frames
+            or stop_elapsed >= self.aeb_critical_reaction_time)
         stop.data = bool(critical_stop or not feasible)
         self.stop_pub.publish(stop)
         self.avoidance_pub.publish(avoidance)
         speed_limit = self.maximum_planning_speed
+        # Proactive, continuous speed governor: while an obstacle is tracked
+        # but no candidate avoidance path is confirmed safe yet -- including
+        # a NO_COLLISION_FREE_PATH stalemate still searching for one -- cap
+        # speed by how much distance is actually left to it. Reproduced on
+        # busan at speed=5.0m/s: speed_limit stayed at the full 5.0 ceiling
+        # right up to the instant an emergency stop fired (commanded speed
+        # was still climbing 4.2 -> 5.0 m/s only 50ms before
+        # NO_COLLISION_FREE_PATH), so there was no graduated slowdown while
+        # avoidance searched -- only an abrupt full-speed/full-stop toggle.
+        # This mirrors the AEB stopping-distance formula (distance =
+        # reaction + v^2/2a) but solved for v as a continuous cap instead of
+        # AEB's binary trigger, using the gentler planning-horizon reaction
+        # time/deceleration (not AEB's tight last-resort numbers) so it
+        # engages earlier and smoothly.
+        #
+        # Deliberately skipped once avoidance.data is true: a confirmed,
+        # locked-in safe candidate means the vehicle already knows it clears
+        # the obstacle/wall gap, so it should accelerate back out on that
+        # confirmed geometry (governed by the curvature-based limit below)
+        # instead of continuing to brake for an obstacle it has already
+        # solved a path around.
+        # Confirmed tracks (active) require obstacle_confirmation_frames
+        # consecutive hits before appearing here, same as avoidance itself
+        # -- reproduced on busan: an obstacle placed just past the previous
+        # one confirmed only 50ms before AEB fired, so neither this
+        # governor nor avoidance ever saw it in time, and the vehicle was
+        # still accelerating at full speed_limit right up to the emergency
+        # stop. nearest_corridor_distance is the same raw, unconfirmed
+        # scan-cluster distance AEB itself reacts to (computed every scan,
+        # no confirmation delay) -- folding it in here closes that blind
+        # spot for the proactive cap too. A false positive here only costs
+        # some speed, not a committed steering decision, so skipping
+        # confirmation is an acceptable trade even though avoidance itself
+        # still requires it.
+        nearest_forward = self.nearest_corridor_distance
+        if active:
+            nearest_forward = min(nearest_forward, active[0][0])
+        if not avoidance.data and math.isfinite(nearest_forward):
+            available = max(
+                0.0, nearest_forward - self.planning_distance_margin)
+            reaction_term = (
+                self.planning_deceleration * self.planning_reaction_time)
+            proactive_speed = -reaction_term + math.sqrt(
+                reaction_term ** 2 + 2.0 * self.planning_deceleration * available)
+            speed_limit = min(speed_limit, max(
+                self.minimum_avoidance_speed, proactive_speed))
         if avoidance.data:
             selected_curvature = self.candidate_curvature(
                 selected, vehicle_s, planning_horizon)
+            # Blend the same way unicorn_l1_node's curvature_scaled_
+            # lateral_limit() does, so this published cap does not fight
+            # the controller's own curvature-based speed profile.
+            span = max(1e-6, (
+                self.tight_curvature_threshold
+                - self.gentle_curvature_threshold))
+            blend = min(1.0, max(0.0, (
+                abs(selected_curvature) - self.gentle_curvature_threshold)
+                / span))
+            lateral_limit = self.max_lateral_acceleration + blend * (
+                self.tight_lateral_acceleration
+                - self.max_lateral_acceleration)
             curve_speed = math.sqrt(
-                self.max_lateral_acceleration
-                / max(selected_curvature, 1e-3))
+                lateral_limit / max(selected_curvature, 1e-3))
             # A high closing rate to a moving obstacle leaves less time to
             # react than the same curvature would around a static one; derate
             # the curvature-based limit further, on top of it, rather than

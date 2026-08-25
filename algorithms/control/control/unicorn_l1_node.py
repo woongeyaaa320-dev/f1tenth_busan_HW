@@ -48,9 +48,13 @@ def build_closed_velocity_profile(
         raise ValueError('curvature and segment lengths must be non-empty')
 
     maximum_speed = max(0.0, float(maximum_speed))
-    lateral = max(1e-3, float(maximum_lateral_acceleration))
     acceleration = max(1e-3, float(maximum_acceleration))
     deceleration = max(1e-3, float(maximum_deceleration))
+    # maximum_lateral_acceleration may be a scalar (one ceiling for the
+    # whole track) or a per-point array (curvature_scaled_lateral_limit
+    # below) -- both broadcast the same way against curvature.
+    lateral = np.maximum(
+        1e-3, np.asarray(maximum_lateral_acceleration, dtype=float))
     profile = np.minimum(
         maximum_speed,
         np.sqrt(lateral / np.maximum(curvature, 1e-4)))
@@ -74,6 +78,27 @@ def build_closed_velocity_profile(
                 + 2.0 * deceleration * segment_lengths[index]))
             profile[index] = min(profile[index], reachable)
     return profile
+
+
+def curvature_scaled_lateral_limit(
+        curvature, gentle_limit, tight_limit,
+        gentle_curvature_threshold, tight_curvature_threshold):
+    """Blend the lateral-G ceiling by local curvature, not track position.
+
+    One constant `max_lateral_acceleration` for the whole lap forces a
+    choice between "safe in tight corners" and "fast on gentle ones".
+    Reproduced on busan at speed=5.0 m/s: a single 4.0 m/s^2 ceiling held
+    cleanly through gentle bends but produced two separate collisions
+    (an obstacle clip, then a wall clip) in tight-curvature sections
+    within the same runs. Below `gentle_curvature_threshold` the full
+    `gentle_limit` applies; at or above `tight_curvature_threshold` only
+    `tight_limit` applies; the two blend linearly in between. Curvature-
+    driven so it needs no per-track hardcoded segment list.
+    """
+    curvature = np.abs(np.asarray(curvature, dtype=float))
+    span = max(1e-6, tight_curvature_threshold - gentle_curvature_threshold)
+    blend = np.clip((curvature - gentle_curvature_threshold) / span, 0.0, 1.0)
+    return gentle_limit + blend * (tight_limit - gentle_limit)
 
 
 class UnicornL1Node(Node):
@@ -108,6 +133,14 @@ class UnicornL1Node(Node):
         self.declare_parameter('min_command_speed', 0.0)
         self.declare_parameter('max_speed', 1.0)
         self.declare_parameter('max_lateral_acceleration', 1.50)
+        # Curvature-scaled lateral-G limit: see curvature_scaled_lateral_
+        # limit() above for why one constant for the whole track is
+        # insufficient. tight_lateral_acceleration applies once local
+        # curvature reaches tight_curvature_threshold; max_lateral_
+        # acceleration stays the ceiling below gentle_curvature_threshold.
+        self.declare_parameter('tight_lateral_acceleration', 3.00)
+        self.declare_parameter('gentle_curvature_threshold', 0.15)
+        self.declare_parameter('tight_curvature_threshold', 0.55)
         self.declare_parameter('max_longitudinal_acceleration', 2.0)
         self.declare_parameter('max_longitudinal_deceleration', 4.0)
         self.declare_parameter('avoidance_speed_limit', 1.50)
@@ -219,7 +252,8 @@ class UnicornL1Node(Node):
         for name in (
                 'wheelbase', 'target_speed', 'min_reference_speed',
                 'min_command_speed', 'max_speed',
-                'max_lateral_acceleration',
+                'max_lateral_acceleration', 'tight_lateral_acceleration',
+                'gentle_curvature_threshold', 'tight_curvature_threshold',
                 'max_longitudinal_acceleration',
                 'max_longitudinal_deceleration', 'avoidance_speed_limit',
                 'max_steering_angle',
@@ -255,6 +289,13 @@ class UnicornL1Node(Node):
                 'min_command_speed must be between 0 and max_speed')
         if self.max_lateral_acceleration <= 0.0:
             raise RuntimeError('max_lateral_acceleration must be positive')
+        if self.tight_lateral_acceleration <= 0.0:
+            raise RuntimeError('tight_lateral_acceleration must be positive')
+        if (self.tight_curvature_threshold
+                < self.gentle_curvature_threshold):
+            raise RuntimeError(
+                'tight_curvature_threshold must be >= '
+                'gentle_curvature_threshold')
         if (self.max_longitudinal_acceleration <= 0.0
                 or self.max_longitudinal_deceleration <= 0.0):
             raise RuntimeError(
@@ -463,7 +504,12 @@ class UnicornL1Node(Node):
             self.path_speed_curvature,
             self.path_segment_lengths,
             self.max_speed,
-            self.max_lateral_acceleration,
+            curvature_scaled_lateral_limit(
+                self.path_speed_curvature,
+                self.max_lateral_acceleration,
+                self.tight_lateral_acceleration,
+                self.gentle_curvature_threshold,
+                self.tight_curvature_threshold),
             self.max_longitudinal_acceleration,
             self.max_longitudinal_deceleration,
         )
