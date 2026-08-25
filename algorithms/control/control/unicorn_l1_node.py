@@ -139,6 +139,16 @@ class UnicornL1Node(Node):
         # cost of higher lateral tracking error (more preview -> cuts
         # corners more).
         self.declare_parameter('t_clip_min', 1.00)
+        # t_clip_min above was only validated at 2.0 m/s. Raising the launch
+        # speed to 3.0 m/s on busan reproduced the same too-short-L1
+        # oscillation again (continuous steering swings, though no longer
+        # saturating/colliding thanks to the separate speed-scaled clearance
+        # margin in local_obstacle_planner_node). Rather than re-tune
+        # t_clip_min by hand every time the target speed changes, scale it
+        # up the same way: extra floor distance per (m/s) above the speed
+        # t_clip_min was actually validated at.
+        self.declare_parameter('t_clip_min_speed_gain', 0.4)
+        self.declare_parameter('t_clip_min_speed_baseline', 2.0)
         # 8.00 (UNICORN's original default) is over 1/3 of track03's ~23m
         # lap: on a straight run-up (near-zero curvature, so the
         # l1_curvature_preview_distance ceiling below doesn't engage) the L1
@@ -215,7 +225,8 @@ class UnicornL1Node(Node):
                 'max_steering_angle',
                 'max_steering_delta', 'max_steering_rate',
                 'transform_fault_grace',
-                't_clip_min', 't_clip_max', 'm_l1',
+                't_clip_min', 't_clip_min_speed_gain',
+                't_clip_min_speed_baseline', 't_clip_max', 'm_l1',
                 'q_l1', 'curvature_factor', 'future_constant',
                 'curvature_window_start', 'curvature_window_end',
                 'maximum_preview_heading', 'l1_curvature_preview_distance',
@@ -660,8 +671,11 @@ class UnicornL1Node(Node):
         curvature_scaler = (
             self.curvature_factor * mean_curvature * speed * speed)
         raw_l1 = self.m_l1 * speed_for_l1 - curvature_scaler + self.q_l1
+        speed_scaled_t_clip_min = self.t_clip_min + (
+            self.t_clip_min_speed_gain
+            * max(0.0, speed - self.t_clip_min_speed_baseline))
         lower_l1 = max(
-            self.t_clip_min,
+            speed_scaled_t_clip_min,
             math.sqrt(2.0) * abs(future_lateral_error))
         l1_distance = self.clamp(raw_l1, lower_l1, self.t_clip_max)
 

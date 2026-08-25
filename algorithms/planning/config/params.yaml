@@ -106,6 +106,13 @@ local_obstacle_planner_node:
     # feasible offset, so without this floor the offset actually commanded
     # routinely carried only a few millimetres of theoretical clearance.
     minimum_required_clearance: 0.04
+    # Extra clearance margin (m) per (m/s) of ego speed above the baseline
+    # below. Reproduced on busan seed=43: margins that held repeatedly at
+    # 2.0 m/s let the same obstacle collide at 3.0 m/s, because pure-pursuit
+    # tracking lag grows with speed while the curvature-based dynamic speed
+    # limit (a_y = v^2*kappa) does not account for that.
+    speed_clearance_gain: 0.15
+    speed_clearance_baseline: 2.0
 
     # Performance-oriented AEB: confirmed dense clusters only.  Physical
     # footprint collision and no-feasible-path stops remain unchanged.

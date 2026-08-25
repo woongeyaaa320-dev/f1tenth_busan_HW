@@ -121,6 +121,17 @@ class LocalObstaclePlannerNode(Node):
         self.declare_parameter('wheelbase', 0.33)
         self.declare_parameter('max_steering_angle', 0.4189)
         self.declare_parameter('obstacle_safety_margin', 0.02)
+        # Pure-pursuit tracking lag grows with ego speed (same reaction time,
+        # more distance covered), so the same physical clearance margin that
+        # holds at one speed can be consumed entirely at a higher one.
+        # Reproduced on busan seed=43: the same obstacle, same margins,
+        # cleared repeatedly at 2.0 m/s but collided at 3.0 m/s with the
+        # planner's own curvature-based speed limit barely engaging (stayed
+        # 2.7-3.0 m/s through the whole approach) -- a_y=v^2*kappa alone
+        # does not account for this. speed_clearance_baseline is the speed
+        # the static margins above were actually validated at.
+        self.declare_parameter('speed_clearance_gain', 0.15)
+        self.declare_parameter('speed_clearance_baseline', 2.0)
         # candidate_is_safe() previously accepted any candidate with
         # clearance >= 0.0. Candidate scoring always prefers the smallest
         # feasible offset, so a bare >=0 acceptance test means the offset
@@ -269,6 +280,10 @@ class LocalObstaclePlannerNode(Node):
             math.tan(self.max_steering_angle) / self.wheelbase)
         self.obstacle_margin = float(
             self.get_parameter('obstacle_safety_margin').value)
+        self.speed_clearance_gain = max(0.0, float(
+            self.get_parameter('speed_clearance_gain').value))
+        self.speed_clearance_baseline = float(
+            self.get_parameter('speed_clearance_baseline').value)
         self.minimum_required_clearance = float(
             self.get_parameter('minimum_required_clearance').value)
         self.aeb_half_width = float(
@@ -739,13 +754,19 @@ class LocalObstaclePlannerNode(Node):
     def effective_obstacle_margin(self, obstacle):
         """Return the safety margin to use for this specific obstacle.
 
-        A dynamic obstacle gets extra margin proportional to how fast the
-        gap to it is closing, on top of the usual static margin. A dynamic
-        obstacle that is not closing (same direction, moving away or faster
-        than ego) keeps the plain static margin -- there is no dynamics-based
-        reason to widen it further.
+        Every obstacle gets extra margin proportional to how far ego speed
+        is above speed_clearance_baseline: pure-pursuit tracking lag grows
+        with speed (same reaction time, more distance covered), so a margin
+        that holds at one speed can be consumed entirely at a higher one. A
+        dynamic obstacle additionally gets margin proportional to how fast
+        the gap to it is closing; one that is not closing (same direction,
+        moving away or faster than ego) keeps only the speed-based term --
+        there is no dynamics-based reason to widen it further.
         """
-        margin = self.obstacle_margin
+        margin = (
+            self.obstacle_margin
+            + self.speed_clearance_gain * max(
+                0.0, self.speed - self.speed_clearance_baseline))
         if obstacle.get('dynamic'):
             closing_speed = max(0.0, float(obstacle.get('closing_speed', 0.0)))
             margin += self.dynamic_margin_gain * closing_speed
